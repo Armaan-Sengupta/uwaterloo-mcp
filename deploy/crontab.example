@@ -1,0 +1,10 @@
+# Run the silent UWaterloo LEARN keep-alive every 45 minutes (never triggers Duo Push).
+# Adjust paths and Node binary location for your machine.
+
+*/45 * * * * cd /opt/uwaterloo-mcp && /usr/bin/node dist/scripts/keep-alive.js >> /var/log/uwaterloo-mcp-keepalive.log 2>&1
+
+# Alternative during development (using tsx without building dist/):
+# */45 * * * * cd /opt/uwaterloo-mcp && npx tsx scripts/keep-alive.ts >> /var/log/uwaterloo-mcp-keepalive.log 2>&1
+
+# Or if calling an already-running server's /api/keep-alive endpoint using CRON_SECRET:
+# */45 * * * * curl -fsS -H "X-Cron-Secret: YOUR_CRON_SECRET" http://127.0.0.1:8787/api/keep-alive >/dev/null
