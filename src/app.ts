@@ -38,6 +38,8 @@ import { verifyFileToken } from "./fileUrls.js";
 import {
   CompositeDuoPasscodeProvider,
   createConfiguredPasscodeProviders,
+  getDuoPhoneLast4,
+  getDuoSmsMaxAttemptsPerDay,
   ManualPasscodeCoordinator,
   sanitizePasscode,
   type DuoPasscodeProvider,
@@ -55,10 +57,13 @@ import {
   type SessionSnapshot,
 } from "./setup.js";
 import {
+  canRequestDuoSms,
+  nextDailySmsAttempts,
   sessionStore,
   storedPiazzaCredentials,
   storedWaterlooCredentials,
   syncSession,
+  torontoDayKey,
 } from "./sessionStore.js";
 import { signInUWaterloo, WaterlooLoginError, type WaterlooLoginEvent } from "./waterlooLogin.js";
 import { PiazzaClient } from "./piazza/client.js";
@@ -173,6 +178,7 @@ function registerSetupRoute(app: Express, config: Config): void {
   const form = express.urlencoded({ extended: false, limit: "16kb" });
   const store = sessionStore(config);
   const manualPasscodes = new ManualPasscodeCoordinator();
+  const setupConsumedSpekoIds = new Set<string>();
 
   const bearerMatches = (req: Request, expected: string | null): boolean => {
     if (!expected) return false;
@@ -302,7 +308,8 @@ function registerSetupRoute(app: Express, config: Config): void {
       const existing = await store.current();
       await store.update({
         cookie,
-        keepAlive: existing?.keepAlive ?? true,
+        keepAlive: existing?.duoSmsCappedDay ? true : (existing?.keepAlive ?? true),
+        duoSmsCappedDay: undefined,
         lastPingAt: Date.now(),
         lastAttemptAt: Date.now(),
         consecutiveFailures: 0,
@@ -561,6 +568,7 @@ function registerSetupRoute(app: Express, config: Config): void {
       if (enabled) {
         await store.update({
           keepAlive: true,
+          duoSmsCappedDay: undefined,
           consecutiveFailures: 0,
           lastPingError: undefined,
         });
@@ -577,7 +585,7 @@ function registerSetupRoute(app: Express, config: Config): void {
           }),
         );
       } else {
-        await store.update({ keepAlive: false });
+        await store.update({ keepAlive: false, duoSmsCappedDay: undefined });
         res.type("html").send(
           setupPage({
             ...(await setupState(req, true)),
@@ -647,7 +655,11 @@ function registerSetupRoute(app: Express, config: Config): void {
           },
         });
       }
-      providers.push(...createConfiguredPasscodeProviders());
+      providers.push(
+        ...createConfiguredPasscodeProviders(process.env, {
+          consumedIds: setupConsumedSpekoIds,
+        }),
+      );
       providers.push(
         manualPasscodes.createProvider((loginId, ctx) => {
           activeLoginId = loginId;
@@ -659,12 +671,24 @@ function registerSetupRoute(app: Express, config: Config): void {
         }),
       );
       const passcodeProvider = new CompositeDuoPasscodeProvider(providers);
+      const maxSmsPerDay = getDuoSmsMaxAttemptsPerDay();
 
       let login: Awaited<ReturnType<typeof signInUWaterloo>>;
       try {
         login = await signInUWaterloo(credentials, config.d2lHost, {
           mode: "interactive",
           passcodeProvider,
+          phoneLast4: getDuoPhoneLast4(),
+          onBeforeSmsRequest: async () => {
+            const latest = await store.current(true);
+            return canRequestDuoSms(latest, maxSmsPerDay);
+          },
+          onSmsRequested: async (requestedAt) => {
+            const latest = await store.current(true);
+            await store.update({
+              duoSmsAttempts: nextDailySmsAttempts(latest?.duoSmsAttempts, requestedAt),
+            });
+          },
           onEvent: (event) => writeWaterlooSetupCode(res, event),
           browserCookies: (await store.current())?.browserCookies,
         });
@@ -675,6 +699,15 @@ function registerSetupRoute(app: Express, config: Config): void {
           error instanceof WaterlooLoginError
             ? error.message
             : "UWaterloo sign-in failed without changing the existing Learn session.";
+        if (error instanceof WaterlooLoginError && error.code === "duo_sms_capped") {
+          await store
+            .update({
+              keepAlive: false,
+              duoSmsCappedDay: torontoDayKey(),
+              lastPingError: message,
+            })
+            .catch(() => undefined);
+        }
         if (
           error instanceof WaterlooLoginError &&
           error.code === "invalid_credentials" &&

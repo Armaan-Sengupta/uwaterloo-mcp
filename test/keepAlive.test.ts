@@ -12,7 +12,13 @@ import {
   isKeepAliveDue,
   pingLearnSession,
 } from "../src/keepAlive.js";
-import { sessionStore } from "../src/sessionStore.js";
+import {
+  canRequestDuoSms,
+  getDailySmsAttemptCount,
+  nextDailySmsAttempts,
+  sessionStore,
+  torontoDayKey,
+} from "../src/sessionStore.js";
 import { WaterlooLoginError } from "../src/waterlooLogin.js";
 
 function makeConfig(): Config {
@@ -197,5 +203,108 @@ test("pingLearnSession disables keep-alive after MAX_CONSECUTIVE_FAILURES and re
     assert.equal(rec?.consecutiveFailures, 0);
     assert.equal(rec?.lastPingAt, 999_000);
     assert.equal(rec?.lastPingError, undefined);
+  });
+});
+
+test("daily Duo SMS attempt cap enforces 3/day in America/Toronto and resets next calendar day", () => {
+  // 2026-11-15T20:00:00-05:00 (America/Toronto)
+  const day1 = Date.parse("2026-11-16T01:00:00.000Z");
+  // 2026-11-16T00:05:00-05:00 (America/Toronto)
+  const day2 = Date.parse("2026-11-16T05:05:00.000Z");
+
+  assert.equal(torontoDayKey(day1), "2026-11-15");
+  assert.equal(torontoDayKey(day2), "2026-11-16");
+
+  let attempts = undefined;
+  assert.equal(canRequestDuoSms({ duoSmsAttempts: attempts }, 3, day1), true);
+  assert.equal(getDailySmsAttemptCount({ duoSmsAttempts: attempts }, day1), 0);
+
+  attempts = nextDailySmsAttempts(attempts, day1);
+  attempts = nextDailySmsAttempts(attempts, day1);
+  assert.equal(canRequestDuoSms({ duoSmsAttempts: attempts }, 3, day1), true);
+
+  attempts = nextDailySmsAttempts(attempts, day1);
+  assert.deepEqual(attempts, { day: "2026-11-15", count: 3 });
+  assert.equal(canRequestDuoSms({ duoSmsAttempts: attempts }, 3, day1), false);
+
+  // Next America/Toronto calendar day resets available quota
+  assert.equal(getDailySmsAttemptCount({ duoSmsAttempts: attempts }, day2), 0);
+  assert.equal(canRequestDuoSms({ duoSmsAttempts: attempts }, 3, day2), true);
+});
+
+test("pingLearnSession uses automatic mode with Speko configured, enforces daily SMS cap, and resumes next day", async () => {
+  await withTempDataDir(async () => {
+    const config = makeConfig();
+    const store = sessionStore(config);
+    const day1 = Date.parse("2026-11-16T01:00:00.000Z"); // 2026-11-15 in Toronto
+    const day2 = Date.parse("2026-11-16T05:05:00.000Z"); // 2026-11-16 in Toronto
+
+    await store.update({
+      cookie: "d2lSessionVal=expired",
+      keepAlive: true,
+      waterloo: { username: "jdoe@uwaterloo.ca", password: "pw" },
+      browserCookies: [],
+      duoSmsAttempts: { day: torontoDayKey(day1), count: 2 },
+    });
+
+    let seenMode: string | undefined;
+    let seenProviderKind: string | undefined;
+    let seenPhoneLast4: string | undefined;
+
+    const spekoEnv = {
+      DUO_CODE_PROVIDER: "speko",
+      SPEKO_API_KEY: "sk_live_test",
+      DUO_PHONE_LAST4: "9915",
+    };
+
+    // 3rd SMS attempt succeeds
+    const okRes = await pingLearnSession(config, {
+      now: () => day1,
+      env: spekoEnv,
+      checkSession: async (_host, cookie) =>
+        cookie === "d2lSessionVal=fresh"
+          ? { alive: true, who: "Jane Doe" }
+          : { alive: false, reason: "Expired" },
+      silentSignIn: async (_creds, _host, opts) => {
+        seenMode = opts?.mode;
+        seenProviderKind = opts?.passcodeProvider?.kind;
+        seenPhoneLast4 = opts?.phoneLast4;
+        assert.equal(await opts?.onBeforeSmsRequest?.(), true);
+        await opts?.onSmsRequested?.(day1);
+        return { cookie: "d2lSessionVal=fresh", duoPrompted: true, browserCookies: [] };
+      },
+    });
+
+    assert.equal(okRes.ok, true);
+    assert.equal(seenMode, "automatic");
+    assert.equal(seenProviderKind, "speko");
+    assert.equal(seenPhoneLast4, "9915");
+    assert.deepEqual((await store.current(true))?.duoSmsAttempts, {
+      day: "2026-11-15",
+      count: 3,
+    });
+
+    // 4th attempt on same day hits the SMS cap before clicking Text me and disables keep-alive
+    config.d2l = { host: "https://learn.uwaterloo.ca", cookie: "d2lSessionVal=expired", csrfToken: undefined };
+    const cappedRes = await pingLearnSession(config, {
+      now: () => day1 + 60_000,
+      env: spekoEnv,
+      checkSession: async () => ({ alive: false, reason: "Expired" }),
+      silentSignIn: async (_creds, _host, opts) => {
+        const allowed = await opts?.onBeforeSmsRequest?.();
+        assert.equal(allowed, false);
+        throw new WaterlooLoginError("duo_sms_capped", "Daily SMS cap reached");
+      },
+    });
+
+    assert.equal(cappedRes.ok, false);
+    assert.equal(cappedRes.disabledKeepAlive, true);
+    assert.equal(cappedRes.errorCode, "duo_sms_capped");
+
+    const cappedRec = await store.current(true);
+    assert.equal(cappedRec?.keepAlive, false);
+    assert.equal(cappedRec?.duoSmsCappedDay, "2026-11-15");
+    assert.equal(isKeepAliveDue(cappedRec, day1 + 3_600_000), false);
+    assert.equal(isKeepAliveDue(cappedRec, day2), true);
   });
 });

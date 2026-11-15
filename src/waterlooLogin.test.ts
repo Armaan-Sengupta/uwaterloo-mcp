@@ -158,3 +158,84 @@ test("does not treat unrelated numbers as a Duo verification code", () => {
     null,
   );
 });
+
+test("automatic mode prefers SMS matching DUO_PHONE_LAST4, escapes Duo Mobile passcode via Other options, and never pushes", () => {
+  assert.deepEqual(
+    decideDuoAction(
+      {
+        url: duoUrl,
+        text: "Choose how to verify your identity",
+        controls: ["Duo Push", "Text me at ••••1234", "Text me at ••••9915"],
+      },
+      "automatic",
+      { phoneLast4: "9915" },
+    ),
+    { action: "select_sms_passcode", label: "Text me at ••••9915" },
+  );
+
+  assert.deepEqual(
+    decideDuoAction(
+      {
+        url: duoUrl,
+        text: "Choose how to verify your identity",
+        controls: ["Duo Push", "SMS to (***) ***-4321", "SMS to (***) ***-9915"],
+      },
+      "automatic",
+      { phoneLast4: "9915" },
+    ),
+    { action: "select_sms_passcode", label: "SMS to (***) ***-9915" },
+  );
+
+  // Single SMS option uses it even if last4 differs
+  assert.deepEqual(
+    decideDuoAction(
+      {
+        url: duoUrl,
+        text: "Choose how to verify your identity",
+        controls: ["Duo Push", "Text message passcode"],
+      },
+      "automatic",
+      { phoneLast4: "9915" },
+    ),
+    { action: "select_sms_passcode", label: "Text message passcode" },
+  );
+
+  // Automatic mode skips Duo Mobile passcode and uses Other options to reach SMS
+  assert.deepEqual(
+    decideDuoAction(
+      {
+        url: duoUrl,
+        text: "Enter Duo Mobile passcode",
+        controls: ["Duo Mobile passcode", "Other options"],
+      },
+      "automatic",
+    ),
+    { action: "other_options", label: "Other options" },
+  );
+
+  // Never clicks Duo Push in automatic mode
+  assert.equal(
+    decideDuoAction(
+      {
+        url: duoUrl,
+        text: "Choose how to verify your identity",
+        controls: ["Duo Push", "Send me a push"],
+      },
+      "automatic",
+    ),
+    null,
+  );
+
+  // Silent mode still refuses SMS and Other options
+  assert.equal(
+    decideDuoAction(
+      {
+        url: duoUrl,
+        text: "Choose how to verify your identity",
+        controls: ["Text me at ••••9915", "Other options"],
+      },
+      "silent",
+    ),
+    null,
+  );
+});

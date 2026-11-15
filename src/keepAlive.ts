@@ -15,10 +15,20 @@
 import type { Config } from "./config.js";
 import { D2LClient } from "./d2l/client.js";
 import {
+  type DuoPasscodeProvider,
+  SpekoDuoPasscodeProvider,
+  getDuoPhoneLast4,
+  getDuoSmsMaxAttemptsPerDay,
+  isSpekoPasscodeProviderConfigured,
+} from "./duoPasscode.js";
+import {
   type SessionRecord,
+  canRequestDuoSms,
+  nextDailySmsAttempts,
   sessionStore,
   storedWaterlooCredentials,
   syncSession,
+  torontoDayKey,
 } from "./sessionStore.js";
 import {
   type WaterlooLoginOptions,
@@ -31,6 +41,8 @@ export const KEEP_ALIVE_INTERVAL_MS = 45 * 60_000; // 45 minutes
 export const INITIAL_BACKOFF_MS = 5 * 60_000; // 5 minutes after first failure
 export const MAX_CONSECUTIVE_FAILURES = 3;
 
+const consumedSpekoMessageIds = new Set<string>();
+
 export interface PingResult {
   ok: boolean;
   message: string;
@@ -42,6 +54,8 @@ export interface PingResult {
 
 export interface KeepAliveDeps {
   now?: () => number;
+  env?: Record<string, string | undefined>;
+  passcodeProvider?: DuoPasscodeProvider;
   checkSession?: (
     host: string,
     cookie: string,
@@ -65,27 +79,43 @@ export function computeBackoffMs(consecutiveFailures: number): number {
 }
 
 /**
+ * True when keep-alive is enabled, or when it was only paused by today's daily SMS cap and a
+ * new America/Toronto calendar day has started.
+ */
+export function isKeepAliveActive(
+  record: Pick<SessionRecord, "keepAlive" | "duoSmsCappedDay"> | null | undefined,
+  now = Date.now(),
+): boolean {
+  if (!record) return false;
+  if (record.keepAlive) return true;
+  return !!record.duoSmsCappedDay && record.duoSmsCappedDay !== torontoDayKey(now);
+}
+
+/**
  * Returns true if keep-alive is enabled, hasn't hit the failure cap, and enough time has
  * passed since the last ping/attempt (respecting exponential backoff on failure).
  */
 export function isKeepAliveDue(
   record: Pick<
     SessionRecord,
-    "keepAlive" | "lastPingAt" | "lastAttemptAt" | "consecutiveFailures"
+    "keepAlive" | "duoSmsCappedDay" | "lastPingAt" | "lastAttemptAt" | "consecutiveFailures"
   > | null | undefined,
   now = Date.now(),
 ): boolean {
-  if (!record?.keepAlive) return false;
+  if (!isKeepAliveActive(record, now)) return false;
 
-  const failures = record.consecutiveFailures ?? 0;
+  const resumedNextDay = !record?.keepAlive && !!record?.duoSmsCappedDay;
+  if (resumedNextDay) return true;
+
+  const failures = record?.consecutiveFailures ?? 0;
   if (failures >= MAX_CONSECUTIVE_FAILURES) return false;
 
   if (failures > 0) {
-    const lastAttempt = record.lastAttemptAt ?? record.lastPingAt ?? 0;
+    const lastAttempt = record?.lastAttemptAt ?? record?.lastPingAt ?? 0;
     return now - lastAttempt >= computeBackoffMs(failures);
   }
 
-  const lastActivity = Math.max(record.lastPingAt ?? 0, record.lastAttemptAt ?? 0);
+  const lastActivity = Math.max(record?.lastPingAt ?? 0, record?.lastAttemptAt ?? 0);
   return now - lastActivity >= KEEP_ALIVE_INTERVAL_MS;
 }
 
@@ -124,6 +154,7 @@ async function executePing(
   deps: KeepAliveDeps = {},
 ): Promise<PingResult> {
   const now = deps.now ?? Date.now;
+  const env = deps.env ?? process.env;
   const checkSession = deps.checkSession ?? defaultCheckSession;
   const silentSignIn = deps.silentSignIn ?? signInUWaterloo;
 
@@ -131,8 +162,9 @@ async function executePing(
   const store = sessionStore(config);
   const record = await store.current();
   const creds = await storedWaterlooCredentials(config);
+  const activeKeepAlive = isKeepAliveActive(record, now());
 
-  if (!config.d2l && !(record?.keepAlive && creds && record?.browserCookies)) {
+  if (!config.d2l && !(activeKeepAlive && creds && record?.browserCookies)) {
     return { ok: false, message: "No Learn session has been established yet." };
   }
 
@@ -142,6 +174,7 @@ async function executePing(
     if (status.alive) {
       const ts = now();
       await store.update({
+        ...(record?.duoSmsCappedDay ? { keepAlive: true, duoSmsCappedDay: undefined } : {}),
         lastPingAt: ts,
         lastAttemptAt: ts,
         consecutiveFailures: 0,
@@ -157,14 +190,43 @@ async function executePing(
     status = { alive: false, reason: "Learn session cookie is missing." };
   }
 
-  // Session has lapsed: try strictly silent trusted-browser sign-in if credentials & cookies exist
+  // Session has lapsed: try silent trusted-browser sign-in, or automatic Speko SMS sign-in when configured.
   if (creds && record?.browserCookies) {
-    console.info("[keep-alive] Session expired; attempting silent re-authentication...");
+    const automaticProvider =
+      deps.passcodeProvider ??
+      (isSpekoPasscodeProviderConfigured(env)
+        ? SpekoDuoPasscodeProvider.fromEnv(env, { consumedIds: consumedSpekoMessageIds })
+        : undefined);
+    const loginMode = automaticProvider ? "automatic" : "silent";
+    const maxSmsPerDay = getDuoSmsMaxAttemptsPerDay(env);
+    const phoneLast4 = getDuoPhoneLast4(env);
+
+    console.info(`[keep-alive] Session expired; attempting ${loginMode} re-authentication...`);
     try {
-      const login = await silentSignIn(creds, config.d2lHost, {
-        mode: "silent",
-        browserCookies: record.browserCookies,
-      });
+      const loginOptions: WaterlooLoginOptions =
+        loginMode === "automatic"
+          ? {
+              mode: "automatic",
+              passcodeProvider: automaticProvider,
+              phoneLast4,
+              browserCookies: record.browserCookies,
+              onBeforeSmsRequest: async () => {
+                const latest = await store.current(true);
+                return canRequestDuoSms(latest, maxSmsPerDay, now());
+              },
+              onSmsRequested: async (requestedAt) => {
+                const latest = await store.current(true);
+                await store.update({
+                  duoSmsAttempts: nextDailySmsAttempts(latest?.duoSmsAttempts, requestedAt),
+                });
+              },
+            }
+          : {
+              mode: "silent",
+              browserCookies: record.browserCookies,
+            };
+
+      const login = await silentSignIn(creds, config.d2lHost, loginOptions);
       const newStatus = await checkSession(config.d2lHost, login.cookie);
       if (newStatus.alive) {
         const ts = now();
@@ -173,6 +235,8 @@ async function executePing(
         await store.update({
           cookie: login.cookie,
           browserCookies: login.browserCookies,
+          ...(activeKeepAlive ? { keepAlive: true } : {}),
+          duoSmsCappedDay: undefined,
           lastPingAt: ts,
           lastAttemptAt: ts,
           consecutiveFailures: 0,
@@ -188,13 +252,13 @@ async function executePing(
 
       const ts = now();
       const nextFailures = (record.consecutiveFailures ?? 0) + 1;
-      const disable = record.keepAlive ? nextFailures >= MAX_CONSECUTIVE_FAILURES : false;
+      const disable = activeKeepAlive ? nextFailures >= MAX_CONSECUTIVE_FAILURES : false;
       const reason = `Re-login returned an unusable session: ${newStatus.reason}`;
       await store.update({
         lastAttemptAt: ts,
         consecutiveFailures: nextFailures,
         lastPingError: reason,
-        ...(disable ? { keepAlive: false } : {}),
+        ...(disable ? { keepAlive: false, duoSmsCappedDay: undefined } : {}),
       });
       return {
         ok: false,
@@ -214,6 +278,7 @@ async function executePing(
         await store.update({
           waterloo: undefined,
           keepAlive: false,
+          duoSmsCappedDay: undefined,
           lastAttemptAt: ts,
           consecutiveFailures: nextFailures,
           lastPingError: message,
@@ -227,11 +292,31 @@ async function executePing(
         };
       }
 
+      if (code === "duo_sms_capped") {
+        const message =
+          "Daily Duo SMS request limit reached. Keep-alive is disabled until tomorrow (America/Toronto) or a successful sign-in via /setup.";
+        await store.update({
+          keepAlive: false,
+          duoSmsCappedDay: torontoDayKey(ts),
+          lastAttemptAt: ts,
+          consecutiveFailures: 0,
+          lastPingError: message,
+        });
+        console.warn("[keep-alive] Disabled keep-alive (duo_sms_capped): daily SMS cap reached.");
+        return {
+          ok: false,
+          disabledKeepAlive: true,
+          errorCode: code,
+          message,
+        };
+      }
+
       if (code === "duo_required" || code === "duo_denied") {
         const message =
           "Silent re-login requires interactive Duo MFA. Complete sign-in via /setup (passcode flow) to re-enable keep-alive.";
         await store.update({
           keepAlive: false,
+          duoSmsCappedDay: undefined,
           lastAttemptAt: ts,
           consecutiveFailures: nextFailures,
           lastPingError: message,
@@ -245,14 +330,14 @@ async function executePing(
         };
       }
 
-      const disable = record.keepAlive ? nextFailures >= MAX_CONSECUTIVE_FAILURES : false;
+      const disable = activeKeepAlive ? nextFailures >= MAX_CONSECUTIVE_FAILURES : false;
       await store.update({
         lastAttemptAt: ts,
         consecutiveFailures: nextFailures,
         lastPingError: rawMessage,
-        ...(disable ? { keepAlive: false } : {}),
+        ...(disable ? { keepAlive: false, duoSmsCappedDay: undefined } : {}),
       });
-      console.warn(`[keep-alive] Silent re-login failed (attempt ${nextFailures}/${MAX_CONSECUTIVE_FAILURES}):`, rawMessage);
+      console.warn(`[keep-alive] ${loginMode} re-login failed (attempt ${nextFailures}/${MAX_CONSECUTIVE_FAILURES}):`, rawMessage);
       return {
         ok: false,
         disabledKeepAlive: disable,
@@ -267,12 +352,12 @@ async function executePing(
   // Session lapsed without automated re-login capability: still record attempt & backoff
   const ts = now();
   const nextFailures = (record?.consecutiveFailures ?? 0) + 1;
-  const disable = record?.keepAlive ? nextFailures >= MAX_CONSECUTIVE_FAILURES : false;
+  const disable = activeKeepAlive ? nextFailures >= MAX_CONSECUTIVE_FAILURES : false;
   await store.update({
     lastAttemptAt: ts,
     consecutiveFailures: nextFailures,
     lastPingError: status.reason,
-    ...(disable ? { keepAlive: false } : {}),
+    ...(disable ? { keepAlive: false, duoSmsCappedDay: undefined } : {}),
   });
 
   return {
@@ -292,7 +377,7 @@ export async function ensureKeepAliveOnRequest(config: Config): Promise<void> {
   await syncSession(config);
   const store = sessionStore(config);
   const record = await store.current();
-  if (!config.d2l && !(record?.keepAlive && (await storedWaterlooCredentials(config)) && record?.browserCookies)) {
+  if (!config.d2l && !(isKeepAliveActive(record) && (await storedWaterlooCredentials(config)) && record?.browserCookies)) {
     return;
   }
 
@@ -311,7 +396,7 @@ export function startKeepAliveRunner(config: Config): () => void {
     try {
       await syncSession(config);
       const record = await store.current();
-      if (!record?.keepAlive) return;
+      if (!isKeepAliveActive(record)) return;
       if (!config.d2l && !((await storedWaterlooCredentials(config)) && record?.browserCookies)) {
         return;
       }
