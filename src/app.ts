@@ -30,8 +30,18 @@ import { createServer, SUPPORTED_PROTOCOL_VERSIONS } from "./server.js";
 import { combinedVerifier } from "./auth.js";
 import { validateMirroredHeaders } from "./headerValidation.js";
 import { D2LClient } from "./d2l/client.js";
+import { calendarToken, generateDueDatesIcs, verifyCalendarToken } from "./d2l/ics.js";
 import { streamCourseFile, streamSubmissionFile, streamTopicFile } from "./d2l/files.js";
+import { getUpcoming } from "./d2l/upcoming.js";
+import { CrowdmarkClient } from "./crowdmark/client.js";
 import { verifyFileToken } from "./fileUrls.js";
+import {
+  CompositeDuoPasscodeProvider,
+  createConfiguredPasscodeProviders,
+  ManualPasscodeCoordinator,
+  sanitizePasscode,
+  type DuoPasscodeProvider,
+} from "./duoPasscode.js";
 import {
   D2L_IDLE_WINDOW_MS,
   readCookie,
@@ -41,6 +51,7 @@ import {
   setupPage,
   tokenMatches,
   validateCookie,
+  type PageState,
   type SessionSnapshot,
 } from "./setup.js";
 import {
@@ -71,29 +82,52 @@ function inlineScriptValue(value: string): string {
     .replace(/\u2029/g, "\\u2029");
 }
 
+function setFrameDenyHeaders(res: Response): void {
+  res.set("X-Frame-Options", "DENY");
+  res.set("Content-Security-Policy", "frame-ancestors 'none'");
+}
+
 function beginWaterlooSetupProgress(res: Response): void {
   res.status(200).set({
     "Content-Type": "text/html; charset=utf-8",
     "Cache-Control": "no-store",
     "X-Accel-Buffering": "no",
+    "X-Frame-Options": "DENY",
+    "Content-Security-Policy": "frame-ancestors 'none'",
   });
   res.flushHeaders();
   res.write(`<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>UWaterloo sign-in</title><style>
-:root{color-scheme:light dark}body{font-family:ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;max-width:34rem;margin:8vh auto;padding:0 1.25rem;line-height:1.55}h1{font-size:1.35rem}.card{border:1px solid #bbb;border-radius:.65rem;padding:1.2rem;margin-top:1.2rem}.code{font:700 3rem/1 ui-monospace,monospace;letter-spacing:.3em;margin:.5rem 0 1rem;color:#1675d1}p{color:#666}.error{color:#b42318}.success{color:#16794b}a{color:#1675d1}
+:root{color-scheme:light dark}body{font-family:ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;max-width:34rem;margin:8vh auto;padding:0 1.25rem;line-height:1.55}h1{font-size:1.35rem}.card{border:1px solid #bbb;border-radius:.65rem;padding:1.2rem;margin-top:1.2rem}.code{font:700 3rem/1 ui-monospace,monospace;letter-spacing:.3em;margin:.5rem 0 1rem;color:#1675d1}p{color:#666}.error{color:#b42318}.success{color:#16794b}a{color:#1675d1}input{width:100%;box-sizing:border-box;padding:.55rem .7rem;border:1px solid #bbb;border-radius:.45rem;font:inherit;margin:.4rem 0 .8rem}button{background:#1675d1;color:#fff;border:0;border-radius:.45rem;padding:.55rem .95rem;font:inherit;font-weight:600;cursor:pointer}
 </style></head><body><h1>Signing in to UWaterloo Learn</h1>
-<div class="card"><p id="status">Opening UWaterloo and waiting for Duo…</p>
+<div class="card"><p id="status">Opening UWaterloo and checking Duo options…</p>
 <div id="code-panel" hidden><div class="code" id="duo-code"></div><strong>Enter this code in Duo Mobile now.</strong></div>
+<div id="passcode-panel" hidden>
+  <p id="passcode-hint">Enter a Duo SMS text passcode or Duo Mobile passcode.</p>
+  <form id="passcode-form">
+    <input id="passcode-input" type="text" inputmode="numeric" autocomplete="one-time-code" placeholder="6-7 digit passcode" required>
+    <button type="submit">Submit Passcode</button>
+  </form>
+  <p id="passcode-err" class="error"></p>
+</div>
 <p id="return" hidden><a href="/setup">Return to setup</a></p></div>
 <script>
-window.waterlooCode=(code,waiting)=>{document.getElementById("duo-code").textContent=code;document.getElementById("code-panel").hidden=false;document.getElementById("status").textContent=waiting?("Still waiting for Duo approval ("+waiting+"s)."):"Duo is waiting for the verification code."};
-window.waterlooDone=(kind,message)=>{document.getElementById("code-panel").hidden=true;const status=document.getElementById("status");status.className=kind;status.textContent=message;document.getElementById("return").hidden=false};
+let activeLoginId = null;
+window.waterlooCode=(code,waiting)=>{document.getElementById("passcode-panel").hidden=true;document.getElementById("duo-code").textContent=code;document.getElementById("code-panel").hidden=false;document.getElementById("status").textContent=waiting?("Still waiting for Duo verification ("+waiting+"s)."):"Duo verification code ready."};
+window.waterlooNeedPasscode=(loginId,hint)=>{activeLoginId=loginId;document.getElementById("code-panel").hidden=true;document.getElementById("passcode-panel").hidden=false;document.getElementById("status").textContent="Duo MFA passcode required.";if(hint)document.getElementById("passcode-hint").textContent=hint;document.getElementById("passcode-err").textContent="";document.getElementById("passcode-input").focus()};
+document.getElementById("passcode-form").addEventListener("submit",async(e)=>{e.preventDefault();const code=document.getElementById("passcode-input").value.trim();if(!code||!activeLoginId)return;const r=await fetch("/setup/duo-passcode",{method:"POST",headers:{"Content-Type":"application/json"},credentials:"same-origin",body:JSON.stringify({loginId:activeLoginId,passcode:code})});if(!r.ok){document.getElementById("passcode-err").textContent="Passcode could not be submitted. Try again.";return}document.getElementById("passcode-panel").hidden=true;document.getElementById("status").textContent="Submitting passcode to Duo…"});
+window.waterlooDone=(kind,message)=>{document.getElementById("code-panel").hidden=true;document.getElementById("passcode-panel").hidden=true;const status=document.getElementById("status");status.className=kind;status.textContent=message;document.getElementById("return").hidden=false};
 </script>`);
 }
 
 function writeWaterlooSetupCode(res: Response, event: WaterlooLoginEvent): void {
-  // Each write also keeps the streamed response from being buffered shut by an idle proxy.
+  if (event.type === "duo_passcode_required") {
+    res.write(
+      `<script>window.waterlooNeedPasscode(${inlineScriptValue(event.loginId)},${inlineScriptValue(event.hint ?? "")})</script>`,
+    );
+    return;
+  }
   const waiting = event.type === "duo_waiting" ? event.secondsWaiting : 0;
   res.write(
     `<script>window.waterlooCode(${inlineScriptValue(event.code)},${waiting})</script>`,
@@ -138,8 +172,27 @@ function authorizeParams(source: Record<string, string | undefined>): AuthorizeP
 function registerSetupRoute(app: Express, config: Config): void {
   const form = express.urlencoded({ extended: false, limit: "16kb" });
   const store = sessionStore(config);
+  const manualPasscodes = new ManualPasscodeCoordinator();
 
-  const setupState = async (req?: Request) => {
+  const bearerMatches = (req: Request, expected: string | null): boolean => {
+    if (!expected) return false;
+    const authHeader = req.headers.authorization ?? "";
+    const bearer = authHeader.startsWith("Bearer ") ? authHeader.slice(7).trim() : null;
+    return !!(bearer && tokenMatches(bearer, expected));
+  };
+
+  const setupState = async (
+    req?: Request,
+    authenticated = false,
+  ): Promise<Omit<PageState, "authenticated">> => {
+    if (!authenticated) {
+      return {
+        knownUsername: null,
+        loginSaved: false,
+        store: store.kind,
+        piazzaConfigured: false,
+      };
+    }
     await syncSession(config, true);
     const record = await store.current();
     const saved = config.waterloo ? null : (record?.waterloo ?? null);
@@ -147,6 +200,20 @@ function registerSetupRoute(app: Express, config: Config): void {
     const base =
       config.publicUrl ??
       (req ? `${req.protocol}://${req.get("host") || "localhost:" + config.port}` : `http://localhost:${config.port}`);
+
+    let crowdmarkAlive: boolean | undefined;
+    let crowdmarkUser: string | null | undefined;
+    if (config.crowdmark?.cookie) {
+      const cmStatus = await new CrowdmarkClient(config.crowdmark).sessionStatus();
+      crowdmarkAlive = cmStatus.alive;
+      crowdmarkUser = cmStatus.alive ? cmStatus.user : null;
+    }
+
+    const calendarUrl =
+      config.authToken
+        ? `${base}/calendar.ics?token=${encodeURIComponent(calendarToken(config.authToken))}`
+        : `${base}/calendar.ics`;
+
     return {
       knownUsername: (config.waterloo ?? saved)?.username ?? null,
       loginSaved: saved !== null,
@@ -154,15 +221,21 @@ function registerSetupRoute(app: Express, config: Config): void {
       storeError: store.lastError ?? undefined,
       piazzaConfigured: !!piazza,
       piazzaEmail: piazza?.email,
+      crowdmarkConfigured: !!config.crowdmark?.cookie,
+      crowdmarkAlive,
+      crowdmarkUser,
       serverUrl: `${base}/mcp`,
       authToken: config.authToken ?? undefined,
+      calendarUrl,
       keepAliveEnabled: !!record?.keepAlive,
       lastPingAt: record?.lastPingAt,
+      lastPingError: record?.lastPingError,
     };
   };
 
   app.use("/setup", (_req, res, next) => {
     res.set("Cache-Control", "no-store");
+    setFrameDenyHeaders(res);
     next();
   });
 
@@ -181,7 +254,7 @@ function registerSetupRoute(app: Express, config: Config): void {
       // cross-site navigation that Strict would arrive at without the cookie.
       sameSite: "lax",
       secure: req.secure,
-      path: "/setup",
+      path: "/",
       maxAge: SETUP_COOKIE_MAX_AGE_SECONDS * 1000,
     });
   };
@@ -231,6 +304,9 @@ function registerSetupRoute(app: Express, config: Config): void {
         cookie,
         keepAlive: existing?.keepAlive ?? true,
         lastPingAt: Date.now(),
+        lastAttemptAt: Date.now(),
+        consecutiveFailures: 0,
+        lastPingError: undefined,
         ...extra,
       });
       saved = store.persistent;
@@ -248,53 +324,74 @@ function registerSetupRoute(app: Express, config: Config): void {
     "and ask again." +
     (saved
       ? ""
-      : " This server could not save the session, so it will be forgotten when this instance " +
-        "stops; see the note on the setup page about connecting a Blob store.");
-
-  const isLocalRequest = (req: Request): boolean => {
-    const host = req.hostname.toLowerCase();
-    const ip = req.ip || "";
-    return (
-      host === "localhost" ||
-      host === "127.0.0.1" ||
-      ip === "127.0.0.1" ||
-      ip === "::1" ||
-      ip === "::ffff:127.0.0.1"
-    );
-  };
+      : " This server could not save the session, so it will be forgotten when this instance stops.");
 
   app.get("/setup", async (req, res) => {
-    if (!rememberedDevice(req) && !isLocalRequest(req)) {
-      res.type("html").send(setupPage({ ...(await setupState(req)), authenticated: false }));
+    const authed =
+      config.authToken === null ||
+      rememberedDevice(req) ||
+      bearerMatches(req, config.authToken);
+    if (!authed) {
+      res.type("html").send(setupPage({ ...(await setupState(req, false)), authenticated: false }));
       return;
     }
-    if (isLocalRequest(req)) rememberDevice(req, res);
     res.type("html").send(
       setupPage({
-        ...(await setupState(req)),
+        ...(await setupState(req, true)),
         authenticated: true,
         session: await describeSession(),
       }),
     );
   });
 
+  app.post("/setup/duo-passcode", (req, res) => {
+    const body = (req.body ?? {}) as { loginId?: unknown; passcode?: unknown; token?: unknown };
+    const tokenArg = typeof body.token === "string" ? body.token.trim() : "";
+    const authed =
+      config.authToken === null ||
+      rememberedDevice(req) ||
+      bearerMatches(req, config.authToken) ||
+      (!!config.authToken && !!tokenArg && tokenMatches(tokenArg, config.authToken));
+    if (!authed) {
+      res.status(401).json({ ok: false, error: "Unauthorized" });
+      return;
+    }
+
+    const loginId = typeof body.loginId === "string" ? body.loginId.trim() : "";
+    const passcode = typeof body.passcode === "string" ? body.passcode : "";
+    if (!loginId || !sanitizePasscode(passcode)) {
+      res.status(400).json({ ok: false, error: "Invalid loginId or passcode." });
+      return;
+    }
+    const accepted = manualPasscodes.submit(loginId, passcode);
+    if (!accepted) {
+      res.status(404).json({ ok: false, error: "No pending Duo passcode prompt matches this loginId." });
+      return;
+    }
+    res.json({ ok: true });
+  });
+
   app.post("/setup", form, async (req, res) => {
     const body = (req.body ?? {}) as Record<string, string | undefined>;
     const provided = (body["token"] ?? "").trim();
     const viaToken = !!config.authToken && tokenMatches(provided, config.authToken);
-    const isLocal = isLocalRequest(req);
 
-    if (config.authToken && !viaToken && !rememberedDevice(req) && !isLocal) {
+    if (
+      config.authToken &&
+      !viaToken &&
+      !rememberedDevice(req) &&
+      !bearerMatches(req, config.authToken)
+    ) {
       res.status(401).type("html").send(
         setupPage({
-          ...(await setupState(req)),
+          ...(await setupState(req, false)),
           authenticated: false,
           message: { kind: "error", text: "That token is not correct." },
         }),
       );
       return;
     }
-    if (viaToken || isLocal) rememberDevice(req, res);
+    if (viaToken) rememberDevice(req, res);
     const tokenEcho = viaToken ? provided : undefined;
 
     const action = body["action"];
@@ -303,7 +400,7 @@ function registerSetupRoute(app: Express, config: Config): void {
     if (action === undefined || action === "check") {
       res.type("html").send(
         setupPage({
-          ...(await setupState(req)),
+          ...(await setupState(req, true)),
           authenticated: true,
           tokenEcho,
           session: await describeSession(),
@@ -316,7 +413,7 @@ function registerSetupRoute(app: Express, config: Config): void {
       await store.update({ waterloo: undefined });
       res.type("html").send(
         setupPage({
-          ...(await setupState(req)),
+          ...(await setupState(req, true)),
           authenticated: true,
           tokenEcho,
           message: { kind: "success", text: "The saved WatIAM login was removed from this server." },
@@ -333,7 +430,7 @@ function registerSetupRoute(app: Express, config: Config): void {
       if (!email || !password) {
         res.type("html").send(
           setupPage({
-            ...(await setupState(req)),
+            ...(await setupState(req, true)),
             authenticated: true,
             tokenEcho,
             message: { kind: "error", text: "Enter your Piazza email and password." },
@@ -351,7 +448,7 @@ function registerSetupRoute(app: Express, config: Config): void {
 
         res.type("html").send(
           setupPage({
-            ...(await setupState(req)),
+            ...(await setupState(req, true)),
             authenticated: true,
             tokenEcho,
             message: { kind: "success", text: `Connected Piazza account (${email}). Piazza tools are now active.` },
@@ -362,7 +459,7 @@ function registerSetupRoute(app: Express, config: Config): void {
         const errorText = err instanceof Error ? err.message : String(err);
         res.type("html").send(
           setupPage({
-            ...(await setupState(req)),
+            ...(await setupState(req, true)),
             authenticated: true,
             tokenEcho,
             message: { kind: "error", text: `Piazza login failed: ${errorText}` },
@@ -380,7 +477,7 @@ function registerSetupRoute(app: Express, config: Config): void {
       await store.update({ piazza: undefined });
       res.type("html").send(
         setupPage({
-          ...(await setupState(req)),
+          ...(await setupState(req, true)),
           authenticated: true,
           tokenEcho,
           message: { kind: "success", text: "Piazza account disconnected." },
@@ -390,14 +487,87 @@ function registerSetupRoute(app: Express, config: Config): void {
       return;
     }
 
+    if (action === "crowdmark_cookie") {
+      const rawCookie = (body["cookie"] ?? "").trim();
+      if (!rawCookie || /[\r\n\0]/.test(rawCookie)) {
+        res.type("html").send(
+          setupPage({
+            ...(await setupState(req, true)),
+            authenticated: true,
+            tokenEcho,
+            message: { kind: "error", text: "Paste a valid single-line Crowdmark Cookie header." },
+            session: await describeSession(),
+          }),
+        );
+        return;
+      }
+
+      const status = await new CrowdmarkClient({
+        host: config.crowdmarkHost,
+        cookie: rawCookie,
+      }).sessionStatus();
+      if (!status.alive) {
+        res.type("html").send(
+          setupPage({
+            ...(await setupState(req, true)),
+            authenticated: true,
+            tokenEcho,
+            message: {
+              kind: "error",
+              text: `Crowdmark rejected that cookie (${status.reason}). Existing configuration was kept.`,
+            },
+            session: await describeSession(),
+          }),
+        );
+        return;
+      }
+
+      config.crowdmark = { host: config.crowdmarkHost, cookie: rawCookie };
+      process.env.CROWDMARK_COOKIE = rawCookie;
+      await store.update({ crowdmarkCookie: rawCookie });
+      res.type("html").send(
+        setupPage({
+          ...(await setupState(req, true)),
+          authenticated: true,
+          tokenEcho,
+          message: {
+            kind: "success",
+            text: `Connected Crowdmark${status.user ? ` as ${status.user}` : ""}. Read-only Crowdmark tools are active.`,
+          },
+          session: await describeSession(),
+        }),
+      );
+      return;
+    }
+
+    if (action === "crowdmark_disconnect") {
+      delete process.env.CROWDMARK_COOKIE;
+      config.crowdmark = null;
+      await store.update({ crowdmarkCookie: undefined });
+      res.type("html").send(
+        setupPage({
+          ...(await setupState(req, true)),
+          authenticated: true,
+          tokenEcho,
+          message: { kind: "success", text: "Crowdmark disconnected." },
+          session: await describeSession(),
+        }),
+      );
+      return;
+    }
+
     if (action === "toggle_keep_alive") {
       const enabled = body["enabled"] === "1";
       if (enabled) {
+        await store.update({
+          keepAlive: true,
+          consecutiveFailures: 0,
+          lastPingError: undefined,
+        });
         const ping = await pingLearnSession(config);
-        await store.update({ keepAlive: true, lastPingAt: Date.now() });
         res.type("html").send(
           setupPage({
-            ...(await setupState(req)),
+            ...(await setupState(req, true)),
             authenticated: true,
             tokenEcho,
             message: ping.ok
@@ -410,7 +580,7 @@ function registerSetupRoute(app: Express, config: Config): void {
         await store.update({ keepAlive: false });
         res.type("html").send(
           setupPage({
-            ...(await setupState(req)),
+            ...(await setupState(req, true)),
             authenticated: true,
             tokenEcho,
             message: { kind: "success", text: "Keep Signed In disabled. Session will expire after 3 hours of inactivity." },
@@ -425,7 +595,7 @@ function registerSetupRoute(app: Express, config: Config): void {
       const ping = await pingLearnSession(config);
       res.type("html").send(
         setupPage({
-          ...(await setupState(req)),
+          ...(await setupState(req, true)),
           authenticated: true,
           tokenEcho,
           message: ping.ok
@@ -448,7 +618,7 @@ function registerSetupRoute(app: Express, config: Config): void {
       if (!credentials) {
         res.type("html").send(
           setupPage({
-            ...(await setupState(req)),
+            ...(await setupState(req, true)),
             authenticated: true,
             tokenEcho,
             message: { kind: "error", text: "Enter your WatIAM username and password." },
@@ -457,21 +627,54 @@ function registerSetupRoute(app: Express, config: Config): void {
         return;
       }
 
-      // Duo takes as long as it takes, so the response streams: headers and the waiting page
-      // go out first, then the three-digit code, then the outcome.
       beginWaterlooSetupProgress(res);
+      let activeLoginId: string | null = null;
+      const onClose = () => {
+        if (activeLoginId) manualPasscodes.cancel(activeLoginId);
+      };
+      req.on("close", onClose);
+
+      let inlinePasscodeUsed = false;
+      const inlinePasscode = sanitizePasscode(body["passcode"]);
+      const providers: DuoPasscodeProvider[] = [];
+      if (inlinePasscode) {
+        providers.push({
+          kind: "form",
+          async getPasscode() {
+            if (inlinePasscodeUsed) return null;
+            inlinePasscodeUsed = true;
+            return inlinePasscode;
+          },
+        });
+      }
+      providers.push(...createConfiguredPasscodeProviders());
+      providers.push(
+        manualPasscodes.createProvider((loginId, ctx) => {
+          activeLoginId = loginId;
+          writeWaterlooSetupCode(res, {
+            type: "duo_passcode_required",
+            loginId,
+            hint: ctx.hint,
+          });
+        }),
+      );
+      const passcodeProvider = new CompositeDuoPasscodeProvider(providers);
+
       let login: Awaited<ReturnType<typeof signInUWaterloo>>;
       try {
         login = await signInUWaterloo(credentials, config.d2lHost, {
+          mode: "interactive",
+          passcodeProvider,
           onEvent: (event) => writeWaterlooSetupCode(res, event),
           browserCookies: (await store.current())?.browserCookies,
         });
       } catch (error) {
+        req.off("close", onClose);
+        if (activeLoginId) manualPasscodes.cancel(activeLoginId);
         let message =
           error instanceof WaterlooLoginError
             ? error.message
             : "UWaterloo sign-in failed without changing the existing Learn session.";
-        // A saved password that has since been changed: drop it so the page asks again.
         if (
           error instanceof WaterlooLoginError &&
           error.code === "invalid_credentials" &&
@@ -484,6 +687,9 @@ function registerSetupRoute(app: Express, config: Config): void {
         finishWaterlooSetupProgress(res, "error", message);
         return;
       }
+
+      req.off("close", onClose);
+      if (activeLoginId) manualPasscodes.cancel(activeLoginId);
 
       // A typed login is saved only once UWaterloo has accepted it, and only if asked to.
       const remember = typed ? body["remember"] === "1" : undefined;
@@ -508,7 +714,7 @@ function registerSetupRoute(app: Express, config: Config): void {
     if (!validated.ok) {
       res.type("html").send(
         setupPage({
-          ...(await setupState(req)),
+          ...(await setupState(req, true)),
           authenticated: true,
           tokenEcho,
           message: { kind: "error", text: validated.error },
@@ -520,7 +726,7 @@ function registerSetupRoute(app: Express, config: Config): void {
     const adopted = await adopt(validated.cookie);
     res.type("html").send(
       setupPage({
-        ...(await setupState(req)),
+        ...(await setupState(req, true)),
         authenticated: true,
         tokenEcho,
         message: adopted.ok
@@ -532,12 +738,20 @@ function registerSetupRoute(app: Express, config: Config): void {
   });
 
   app.all("/api/keep-alive", async (req, res) => {
-    const authHeader = req.headers.authorization ?? "";
-    const bearer = authHeader.startsWith("Bearer ") ? authHeader.slice(7).trim() : null;
-    const authMatches = !!(bearer && config.authToken && tokenMatches(bearer, config.authToken));
-    const cronHeader = req.headers["x-vercel-cron"];
+    const cronHeader = req.headers["x-cron-secret"];
+    const rawCronHeader = Array.isArray(cronHeader) ? cronHeader[0] : cronHeader;
+    const cronAuthorized =
+      !!config.cronSecret &&
+      (bearerMatches(req, config.cronSecret) ||
+        (typeof rawCronHeader === "string" && tokenMatches(rawCronHeader.trim(), config.cronSecret)));
 
-    if (!authMatches && !rememberedDevice(req) && !isLocalRequest(req) && !cronHeader) {
+    const authorized =
+      config.authToken === null ||
+      bearerMatches(req, config.authToken) ||
+      rememberedDevice(req) ||
+      cronAuthorized;
+
+    if (!authorized) {
       res.status(401).json({ error: "Unauthorized" });
       return;
     }
@@ -677,7 +891,6 @@ export function createApp(config: Config): Express {
 
   app.get("/", async (req, res) => {
     await syncSession(config);
-    await ensureKeepAliveOnRequest(config);
     const store = sessionStore(config);
     const base = config.publicUrl ?? `${req.protocol}://${req.headers.host}`;
     const lines = [
@@ -700,9 +913,10 @@ export function createApp(config: Config): Express {
       "",
       "----",
       "Transport: Streamable HTTP (stateless, MCP 2026-07-28)",
-      `Storage:   ${store.kind}${store.persistent ? "" : " (ephemeral — connect Vercel Blob to persist sessions)"}`,
+      `Storage:   ${store.kind}${store.persistent ? "" : " (ephemeral)"}`,
       `Learn:     ${config.d2l ? "configured" : "not configured"}`,
       `Piazza:    ${config.piazza ? "configured" : "not configured"}`,
+      `Crowdmark: ${config.crowdmark ? "configured" : "not configured"}`,
     );
 
     res.type("text/plain").send(lines.join("\n"));
@@ -711,29 +925,59 @@ export function createApp(config: Config): Express {
   app.get("/healthz", async (_req, res) => {
     const store = sessionStore(config);
     await store.current(true);
-    await ensureKeepAliveOnRequest(config);
-    const record = await store.current();
-    const storageEnvKeys = Object.keys(process.env).filter((k) =>
-      /BLOB|KV|REDIS|STORAGE|UPSTASH|STORE|READ_WRITE/i.test(k),
-    );
     res.json({
       status: "ok",
       server: SERVER_NAME,
       version: VERSION,
       store: store.kind,
       persistent: store.persistent,
-      storageEnvKeys,
-      hasSession: !!record?.cookie,
-      hasWaterloo: !!record?.waterloo,
-      hasPiazza: !!record?.piazza,
-      keepAlive: !!record?.keepAlive,
-      lastPingAt: record?.lastPingAt ?? null,
       storeError: store.lastError,
     });
   });
 
   registerSetupRoute(app, config);
   registerFileDownloadRoute(app, config);
+
+  app.get("/calendar.ics", async (req, res) => {
+    if (config.authToken) {
+      const authHeader = req.headers.authorization ?? "";
+      const bearer = authHeader.startsWith("Bearer ") ? authHeader.slice(7).trim() : null;
+      const queryToken = typeof req.query.token === "string" ? req.query.token : "";
+      const bearerOk = !!(bearer && tokenMatches(bearer, config.authToken));
+      const calTokenOk = !!queryToken && verifyCalendarToken(queryToken, config.authToken);
+      if (!bearerOk && !calTokenOk) {
+        res.status(401).type("text/plain").send("Unauthorized");
+        return;
+      }
+    }
+
+    await syncSession(config);
+    if (!config.d2l) {
+      res.status(503).type("text/plain").send("No Learn session is currently configured.");
+      return;
+    }
+
+    try {
+      const client = new D2LClient(config.d2l);
+      const { deadlines } = await getUpcoming(client, {
+        withinDays: 90,
+        includeSubmitted: true,
+        includeOverdue: true,
+      });
+      const ics = generateDueDatesIcs(deadlines, { d2lHost: config.d2lHost });
+      res
+        .status(200)
+        .set({
+          "Content-Type": "text/calendar; charset=utf-8",
+          "Content-Disposition": 'inline; filename="uwaterloo-learn-due-dates.ics"',
+          "Cache-Control": "private, no-store",
+        })
+        .send(ics);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      res.status(502).type("text/plain").send(`Could not export calendar: ${message}`);
+    }
+  });
 
   /** Origin this request arrived on — the issuer identity for OAuth documents. */
   const originOf = (req: Request): string =>
@@ -781,18 +1025,24 @@ export function createApp(config: Config): Express {
       res.status(status).json(payload);
     });
 
+    app.use("/authorize", (_req, res, next) => {
+      res.set("Cache-Control", "no-store");
+      setFrameDenyHeaders(res);
+      next();
+    });
+
     app.get("/authorize", async (req, res) => {
       const params = authorizeParams(req.query as Record<string, string | undefined>);
       const result = await beginAuthorize(params, staticToken, originOf(req));
       sendAuthorizeResult(res, result);
     });
 
-    app.post("/authorize", express.urlencoded({ extended: false }), (req, res) => {
+    app.post("/authorize", express.urlencoded({ extended: false }), async (req, res) => {
       const body = (req.body ?? {}) as Record<string, string | undefined>;
       const params = authorizeParams(body);
       // The deployment token plays two roles here: the value the operator must enter to
       // approve (`expectedToken`), and the HMAC key everything is signed with (`secret`).
-      const result = completeAuthorize(
+      const result = await completeAuthorize(
         params,
         body["token"] ?? "",
         /* expectedToken */ staticToken,

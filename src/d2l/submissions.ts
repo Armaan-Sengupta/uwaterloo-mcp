@@ -10,6 +10,7 @@
 
 import type { D2LClient } from "./client.js";
 import { getCourseGroups } from "./classlist.js";
+import { listCourses, type Course } from "./courses.js";
 import { extractRubrics, type RubricCriterion } from "./feedback.js";
 import { richText } from "./format.js";
 import type { DropboxFolder } from "./types.js";
@@ -281,4 +282,113 @@ function toSubmissionFile(file: RawFile): SubmissionFileRef {
     isFlagged: file.IsFlagged ?? file.isFlagged ?? false,
     isDeleted: file.IsDeleted === true,
   };
+}
+
+export interface DropboxReceipt {
+  courseId: number;
+  courseName: string;
+  folderId: number;
+  folderName: string;
+  submissionId: number;
+  attemptNumber: number;
+  submittedAt: string | null;
+  submitter: string;
+  dueDate: string | null;
+  isLate: boolean | null;
+  lateByMinutes: number | null;
+  files: SubmissionFileRef[];
+}
+
+/** Computes lateness for a single submission against a folder's due date. */
+export function computeLateStatus(
+  submittedAt: string | null,
+  dueDate: string | null,
+): { isLate: boolean | null; lateByMinutes: number | null } {
+  if (!submittedAt || !dueDate) return { isLate: null, lateByMinutes: null };
+  const subMs = Date.parse(submittedAt);
+  const dueMs = Date.parse(dueDate);
+  if (Number.isNaN(subMs) || Number.isNaN(dueMs)) return { isLate: null, lateByMinutes: null };
+  if (subMs <= dueMs) return { isLate: false, lateByMinutes: 0 };
+  return {
+    isLate: true,
+    lateByMinutes: Math.max(1, Math.ceil((subMs - dueMs) / 60_000)),
+  };
+}
+
+/** Converts an `AssignmentSubmissionHistory` into flat per-attempt receipts. */
+export function receiptsFromHistory(
+  course: Pick<Course, "id" | "name">,
+  history: AssignmentSubmissionHistory,
+): DropboxReceipt[] {
+  return history.submissions.map((attempt) => {
+    const late = computeLateStatus(attempt.submittedAt, history.assignment.dueDate);
+    return {
+      courseId: course.id,
+      courseName: course.name,
+      folderId: history.assignment.id,
+      folderName: history.assignment.name,
+      submissionId: attempt.id,
+      attemptNumber: attempt.number,
+      submittedAt: attempt.submittedAt,
+      submitter: attempt.submittedBy.name,
+      dueDate: history.assignment.dueDate,
+      isLate: late.isLate,
+      lateByMinutes: late.lateByMinutes,
+      files: attempt.files.filter((f) => !f.isDeleted),
+    };
+  });
+}
+
+/**
+ * Collects read-only dropbox submission receipts across one or all active courses.
+ */
+export async function getDropboxReceipts(
+  client: D2LClient,
+  options: { courseId?: number; folderId?: number } = {},
+): Promise<{ receipts: DropboxReceipt[]; failures: string[] }> {
+  const allCourses = await listCourses(client);
+  const courses =
+    options.courseId !== undefined
+      ? allCourses.filter((c) => c.id === options.courseId)
+      : allCourses;
+
+  if (options.courseId !== undefined && courses.length === 0) {
+    throw new Error(`Course ${options.courseId} was not found in active enrollments.`);
+  }
+
+  const failures: string[] = [];
+  const perCourse = await Promise.all(
+    courses.map(async (course): Promise<DropboxReceipt[]> => {
+      let folders: DropboxFolder[];
+      try {
+        folders = await client.le<DropboxFolder[]>(`/${course.id}/dropbox/folders/`);
+      } catch {
+        failures.push(`${course.name}: dropbox folders unavailable`);
+        return [];
+      }
+
+      const selectedFolders =
+        options.folderId !== undefined
+          ? folders.filter((f) => f.Id === options.folderId)
+          : folders;
+
+      const folderReceipts = await Promise.all(
+        selectedFolders.map(async (folder) => {
+          try {
+            const history = await getSubmissionHistory(client, course.id, folder);
+            return receiptsFromHistory(course, history);
+          } catch {
+            return [];
+          }
+        }),
+      );
+      return folderReceipts.flat();
+    }),
+  );
+
+  const receipts = perCourse
+    .flat()
+    .sort((a, b) => Date.parse(b.submittedAt ?? "1970-01-01") - Date.parse(a.submittedAt ?? "1970-01-01"));
+
+  return { receipts, failures };
 }

@@ -12,6 +12,7 @@ import path from "node:path";
 import chromium from "@sparticuz/chromium";
 import puppeteer, { type Browser, type Frame, type Page } from "puppeteer-core";
 import type { WaterlooCredentials } from "./config.js";
+import type { DuoPasscodeProvider } from "./duoPasscode.js";
 import { validateCookie } from "./setup.js";
 import type { StoredBrowserCookie } from "./sessionStore.js";
 
@@ -28,11 +29,14 @@ const HEARTBEAT_INTERVAL_MS = 20_000;
 
 export type WaterlooLoginFailure =
   | "invalid_credentials"
+  | "duo_required"
   | "duo_denied"
   | "duo_timeout"
   | "login_timeout"
   | "browser_unavailable"
   | "session_rejected";
+
+export type WaterlooLoginMode = "silent" | "interactive";
 
 export class WaterlooLoginError extends Error {
   constructor(
@@ -57,6 +61,8 @@ export interface WaterlooLoginResult {
 
 export interface WaterlooLoginOptions {
   timeoutMs?: number | undefined;
+  mode?: WaterlooLoginMode | undefined;
+  passcodeProvider?: DuoPasscodeProvider | undefined;
   onEvent?: WaterlooLoginEventHandler | undefined;
   /** Cookies from a previous successful sign-in, restored before anything is opened. */
   browserCookies?: StoredBrowserCookie[] | undefined;
@@ -64,6 +70,7 @@ export interface WaterlooLoginOptions {
 
 export type WaterlooLoginEvent =
   | { type: "duo_verification_code"; code: string }
+  | { type: "duo_passcode_required"; loginId: string; hint?: string | undefined }
   /**
    * Emitted every HEARTBEAT_INTERVAL_MS while the Duo push is outstanding.
    *
@@ -78,7 +85,9 @@ export type WaterlooLoginEventHandler = (
 ) => void | Promise<void>;
 
 export type DuoPageAction =
-  | "duo_push"
+  | "select_sms_passcode"
+  | "select_passcode"
+  | "enter_passcode"
   | "other_options"
   | "decline_trust"
   | "complete_trust"
@@ -88,6 +97,7 @@ interface FrameState {
   url: string;
   text: string;
   controls: string[];
+  hasPasscodeInput?: boolean | undefined;
 }
 
 export interface DuoActionDecision {
@@ -115,7 +125,13 @@ export function signInUWaterloo(
 async function performSignIn(
   credentials: WaterlooCredentials,
   host: string,
-  { timeoutMs = DEFAULT_TIMEOUT_MS, onEvent, browserCookies }: WaterlooLoginOptions,
+  {
+    timeoutMs = DEFAULT_TIMEOUT_MS,
+    mode = "interactive",
+    passcodeProvider,
+    onEvent,
+    browserCookies,
+  }: WaterlooLoginOptions,
 ): Promise<WaterlooLoginResult> {
   const hostname = new URL(host).hostname.toLowerCase();
   if (hostname !== WATERLOO_LEARN_HOST) {
@@ -181,6 +197,9 @@ async function performSignIn(
       page,
       host,
       timeoutMs,
+      mode,
+      username,
+      passcodeProvider,
       (nextStage) => {
         stage = nextStage;
       },
@@ -335,6 +354,9 @@ async function waitForSession(
   page: Page,
   host: string,
   timeoutMs: number,
+  mode: WaterlooLoginMode,
+  username: string,
+  passcodeProvider: DuoPasscodeProvider | undefined,
   setStage: (stage: string) => void,
   onEvent?: WaterlooLoginEventHandler,
 ): Promise<Omit<WaterlooLoginResult, "browserCookies">> {
@@ -346,6 +368,8 @@ async function waitForSession(
   let lastHeartbeatAt = 0;
   let lastDebugState = "";
   let lastLocation = "";
+  let passcodeAttempts = 0;
+  let lastPasscodeAt = 0;
 
   while (Date.now() < deadline) {
     const location = safePageLocation(page);
@@ -377,7 +401,7 @@ async function waitForSession(
       lastHeartbeatAt = Date.now();
       duoPrompted = true;
       setStage("wait_for_duo_code_entry");
-      console.info(`[waterloo-login] Verified Duo code: ${verificationCode}`);
+      console.info("[waterloo-login] Duo verification code received (not logged)");
       if (onEvent) {
         try {
           await onEvent({ type: "duo_verification_code", code: verificationCode });
@@ -429,10 +453,7 @@ async function waitForSession(
     if (/duo push (?:timed out|expired)|request expired|authentication timed out|verification timed out/.test(combined)) {
       throw new WaterlooLoginError(
         "duo_timeout",
-        "The Duo request expired before approval. Run sign-in again when the phone is " +
-          "available. If no three-digit code ever appeared, this client is not showing the " +
-          "server's progress messages — sign in at /setup instead, which shows the code on " +
-          "the page itself.",
+        "The Duo request expired before approval. Run sign-in again interactively at /setup.",
       );
     }
 
@@ -441,8 +462,19 @@ async function waitForSession(
       setStage("wait_for_duo_approval");
     }
 
+    if (mode === "silent" && states.some(isInteractiveDuoChallenge)) {
+      throw new WaterlooLoginError(
+        "duo_required",
+        "Silent re-login requires Duo verification. Sign in interactively at /setup (passcode flow).",
+      );
+    }
+
     const decisions = states
-      .map((state, index) => ({ state, frame: frames[index], decision: decideDuoAction(state) }))
+      .map((state, index) => ({
+        state,
+        frame: frames[index],
+        decision: decideDuoAction(state, mode),
+      }))
       .filter(
         (entry): entry is { state: FrameState; frame: Frame; decision: DuoActionDecision } =>
           !!entry.frame && !!entry.decision,
@@ -450,6 +482,52 @@ async function waitForSession(
       .sort((a, b) => actionPriority(a.decision.action) - actionPriority(b.decision.action));
 
     for (const { state, frame, decision } of decisions) {
+      if (decision.action === "enter_passcode") {
+        if (Date.now() - lastPasscodeAt < 2_500) continue;
+        if (!passcodeProvider) {
+          throw new WaterlooLoginError(
+            "duo_required",
+            "Duo passcode is required. Sign in interactively at /setup or configure a Duo passcode provider.",
+          );
+        }
+        passcodeAttempts += 1;
+        if (passcodeAttempts > 3) {
+          throw new WaterlooLoginError(
+            "duo_timeout",
+            "Duo rejected the passcode after multiple attempts. Try signing in again at /setup.",
+          );
+        }
+        setStage("wait_for_duo_passcode");
+        const remainingMs = Math.max(1_000, deadline - Date.now());
+        const abort = new AbortController();
+        const timer = setTimeout(() => abort.abort(), remainingMs);
+        let code: string | null = null;
+        try {
+          code = await passcodeProvider.getPasscode({
+            username,
+            attempt: passcodeAttempts,
+            hint: extractDuoHint(state),
+            signal: abort.signal,
+          });
+        } finally {
+          clearTimeout(timer);
+        }
+        if (!code) {
+          throw new WaterlooLoginError(
+            "duo_timeout",
+            "No Duo passcode was provided before the sign-in window ended. Sign in at /setup to enter a passcode.",
+          );
+        }
+        const submitted = await submitPasscodeInFrame(frame, code, decision.label);
+        if (submitted) {
+          lastPasscodeAt = Date.now();
+          duoPrompted = true;
+          setStage("enter_passcode");
+          console.info("[waterloo-login] submitted Duo passcode");
+        }
+        break;
+      }
+
       if (emittedVerificationCode && decision.action === "other_options") continue;
 
       const actionKey = `${decision.action}:${normalizeLabel(decision.label)}`;
@@ -474,7 +552,9 @@ async function waitForSession(
       completedActions.add(actionKey);
       setStage(decision.action);
       console.info("[waterloo-login] handled Duo page", { action: decision.action });
-      if (decision.action === "duo_push") duoPrompted = true;
+      if (decision.action === "select_sms_passcode" || decision.action === "select_passcode") {
+        duoPrompted = true;
+      }
       break;
     }
 
@@ -500,10 +580,7 @@ async function waitForSession(
   throw new WaterlooLoginError(
     duoPrompted ? "duo_timeout" : "login_timeout",
     duoPrompted
-      ? "Duo approval was not completed before the sign-in window ended. Run the tool again " +
-        "when the phone is available. If no three-digit code ever appeared, this client is " +
-        "not showing the server's progress messages — sign in at /setup instead, which " +
-        "shows the code on the page itself."
+      ? "Duo verification was not completed before the sign-in window ended. Sign in again at /setup."
       : "UWaterloo sign-in did not reach Duo or Learn before the sign-in window ended.",
   );
 }
@@ -521,48 +598,80 @@ async function learnCookie(page: Page, host: string): Promise<string | null> {
 async function frameState(frame: Frame): Promise<FrameState> {
   const url = frame.url();
   return frame
-    .evaluate(() => ({
-      text: (document.body?.innerText ?? "").slice(0, 20_000),
-      controls: Array.from(
-        document.querySelectorAll<HTMLElement>(
-          "button, input[type='button'], input[type='submit'], [role='button'], a",
-        ),
-      )
-        .filter(
-          (element) =>
-            element.offsetParent !== null && element.getAttribute("aria-disabled") !== "true",
+    .evaluate(() => {
+      const passcodeSelector =
+        "input[name='passcode'], input[name*='passcode' i], input[aria-label*='passcode' i], input[placeholder*='passcode' i], input[inputmode='numeric']";
+      const hasPasscodeInput = Array.from(document.querySelectorAll<HTMLElement>(passcodeSelector)).some(
+        (el) => el.offsetParent !== null && !(el as HTMLInputElement).disabled,
+      );
+      return {
+        text: (document.body?.innerText ?? "").slice(0, 20_000),
+        hasPasscodeInput,
+        controls: Array.from(
+          document.querySelectorAll<HTMLElement>(
+            "button, input[type='button'], input[type='submit'], [role='button'], a",
+          ),
         )
-        .map(
-          (element) =>
-            element.innerText ||
-            (element as HTMLInputElement).value ||
-            element.getAttribute("aria-label") ||
-            "",
-        ),
-    }))
+          .filter(
+            (element) =>
+              element.offsetParent !== null && element.getAttribute("aria-disabled") !== "true",
+          )
+          .map(
+            (element) =>
+              element.innerText ||
+              (element as HTMLInputElement).value ||
+              element.getAttribute("aria-label") ||
+              "",
+          ),
+      };
+    })
     .then((state) => ({ url, ...state }))
-    .catch(() => ({ url, text: "", controls: [] }));
+    .catch(() => ({ url, text: "", controls: [], hasPasscodeInput: false }));
+}
+
+function isTrustScreenText(text: string): boolean {
+  return /trust (?:this|the) browser|remember (?:this|the) (?:browser|device)|is this your device|remember it for future logins/i.test(
+    text,
+  );
+}
+
+function isApprovedScreenText(text: string): boolean {
+  return /\b(?:approved|success|verified|authentication complete|verification complete)\b/i.test(text);
+}
+
+function isDuoPage(state: Pick<FrameState, "url" | "text">): boolean {
+  return /duo|duosecurity/i.test(`${state.url}\n${state.text}`);
+}
+
+/** True when a Duo frame requires human MFA interaction rather than silent trusted-browser flow. */
+export function isInteractiveDuoChallenge(state: FrameState): boolean {
+  if (!isDuoPage(state)) return false;
+  if (isTrustScreenText(state.text) || isApprovedScreenText(state.text)) return false;
+  if (state.hasPasscodeInput || duoPushIsPending(state)) return true;
+  return state.controls.length > 0 || /passcode|duo push|verify|other options|security key|passkey/i.test(state.text);
+}
+
+function extractDuoHint(state: FrameState): string | undefined {
+  const match = /\(([^)]*\d{4}[^)]*)\)|ending in (\d{4})/i.exec(state.text);
+  return match?.[0];
 }
 
 /**
  * Chooses one safe transition from a Duo page snapshot.
  *
- * Universal Prompt remembers the last factor per user. A fresh browser can therefore land on
- * push, passcode, or a native passkey prompt even though it has no browser history of its own.
+ * Never auto-clicks Duo Push. In `silent` mode, only trust-device and post-approval continue
+ * actions are allowed; any MFA challenge returns null so the caller aborts without pushing.
+ * In `interactive` mode, prefers SMS text-message passcode, then Duo Mobile / bypass passcode,
+ * then "Other options" to escape remembered push/passkey defaults.
  */
-export function decideDuoAction(state: FrameState): DuoActionDecision | null {
-  const locationAndText = `${state.url}\n${state.text}`;
-  if (!/duo|duosecurity/i.test(locationAndText)) return null;
+export function decideDuoAction(
+  state: FrameState,
+  mode: WaterlooLoginMode = "interactive",
+): DuoActionDecision | null {
+  if (!isDuoPage(state)) return null;
 
   const controls = state.controls.map((label) => ({ label, normalized: normalizeLabel(label) }));
-  const trustScreen =
-    /trust (?:this|the) browser|remember (?:this|the) (?:browser|device)|is this your device|remember it for future logins/i.test(
-      state.text,
-    );
-  if (trustScreen) {
-    // The current Universal Prompt renders this as its primary button. The browser is closed
-    // immediately after sign-in, so accepting cannot persist a trusted-device cookie beyond
-    // this one ephemeral run.
+  if (isTrustScreenText(state.text)) {
     const primary = controls.find(({ normalized }) => normalized === "yes this is my device");
     if (primary) return { action: "complete_trust", label: primary.label };
 
@@ -574,10 +683,7 @@ export function decideDuoAction(state: FrameState): DuoActionDecision | null {
     if (decline) return { action: "decline_trust", label: decline.label };
   }
 
-  const approved = /\b(?:approved|success|verified|authentication complete|verification complete)\b/i.test(
-    state.text,
-  );
-  if (approved) {
+  if (isApprovedScreenText(state.text)) {
     const continueControl = controls.find(({ normalized }) =>
       /^(?:continue|continue to (?:login|sign in)|finish|done)$/.test(normalized),
     );
@@ -586,23 +692,40 @@ export function decideDuoAction(state: FrameState): DuoActionDecision | null {
     }
   }
 
-  const push = controls.find(({ normalized }) =>
-    normalized.includes("duo push") ||
-    /^(?:send|verify with)(?: a| me a)? push\b/.test(normalized) ||
-    (/\bpush\b/.test(normalized) && !/passcode|sms|text|call|phone|bypass|key|token/.test(normalized)),
+  // Silent mode never interacts with Duo MFA challenges or prompts for passcodes.
+  if (mode === "silent") return null;
+
+  if (state.hasPasscodeInput) {
+    const verifyControl = controls.find(({ normalized }) =>
+      /^(?:verify|log in|login|submit|continue)$/.test(normalized),
+    );
+    return { action: "enter_passcode", label: verifyControl?.label ?? "Verify" };
+  }
+
+  const smsPasscode = controls.find(
+    ({ normalized }) =>
+      (/\b(?:text message|sms)\b/.test(normalized) && /\b(?:passcode|code|send|text)\b/.test(normalized)) ||
+      /^(?:text me|send text|sms passcode|text message passcode|text passcode)$/.test(normalized),
   );
-  if (push) return { action: "duo_push", label: push.label };
+  if (smsPasscode) return { action: "select_sms_passcode", label: smsPasscode.label };
 
-  // Never open the method chooser while a push is already waiting; doing so cancels a valid
-  // request and can create MFA fatigue if the loop sends another one.
-  if (duoPushIsPending(state)) return null;
+  const passcode = controls.find(
+    ({ normalized }) =>
+      /\b(?:duo mobile passcode|bypass code|passcode)\b/.test(normalized) &&
+      !/\bpush\b/.test(normalized),
+  );
+  if (passcode) return { action: "select_passcode", label: passcode.label };
 
-  const otherOptions = controls.find(({ normalized }) => normalized === "other options");
+  const otherOptions = controls.find(({ normalized }) =>
+    /^(?:other options|try another method|try another way|choose another option|use a different method)$/.test(
+      normalized,
+    ),
+  );
   return otherOptions ? { action: "other_options", label: otherOptions.label } : null;
 }
 
 export function duoPushIsPending(state: Pick<FrameState, "url" | "text">): boolean {
-  if (!/duo|duosecurity/i.test(`${state.url}\n${state.text}`)) return false;
+  if (!isDuoPage(state)) return false;
   if (extractDuoVerificationCode(state)) return true;
   return /check (?:for )?a duo push|push (?:notification )?(?:has been |was )?sent|approve (?:the )?(?:login|notification|request)|waiting for (?:a )?(?:duo )?push|enter (?:the )?(?:verification )?code.*duo mobile|duo push sent/is.test(
     state.text,
@@ -613,7 +736,7 @@ export function duoPushIsPending(state: Pick<FrameState, "url" | "text">): boole
 export function extractDuoVerificationCode(
   state: Pick<FrameState, "url" | "text">,
 ): string | null {
-  if (!/duo|duosecurity/i.test(`${state.url}\n${state.text}`)) return null;
+  if (!isDuoPage(state)) return null;
 
   const text = state.text.replace(/[\u00a0\s]+/g, " ").trim();
   const patterns = [
@@ -633,8 +756,33 @@ export function extractDuoVerificationCode(
 function actionPriority(action: DuoPageAction): number {
   if (action === "decline_trust" || action === "complete_trust") return 0;
   if (action === "continue_after_approval") return 1;
-  if (action === "duo_push") return 2;
-  return 3;
+  if (action === "enter_passcode") return 2;
+  if (action === "select_sms_passcode") return 3;
+  if (action === "select_passcode") return 4;
+  return 5;
+}
+
+async function submitPasscodeInFrame(
+  frame: Frame,
+  code: string,
+  verifyButtonLabel: string,
+): Promise<boolean> {
+  const selector =
+    "input[name='passcode'], input[name*='passcode' i], input[aria-label*='passcode' i], input[placeholder*='passcode' i], input[inputmode='numeric']";
+  const input = await frame.$(selector).catch(() => null);
+  if (!input) return false;
+  await frame
+    .$eval(selector, (el) => {
+      const inp = el as HTMLInputElement;
+      inp.value = "";
+      inp.focus();
+    })
+    .catch(() => undefined);
+  await input.type(code).catch(() => undefined);
+  const clicked = await clickControl(frame, verifyButtonLabel);
+  if (clicked) return true;
+  await input.press("Enter").catch(() => undefined);
+  return true;
 }
 
 function normalizeLabel(value: string): string {

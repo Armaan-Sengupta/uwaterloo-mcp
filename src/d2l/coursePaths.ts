@@ -56,6 +56,11 @@ export function resolveCourseFilePath(courseId: number, host: string, input: str
   if (path.includes("\0")) {
     throw new CourseFilePathError("A course file path cannot contain a null byte.");
   }
+  if (containsEncodedSeparator(path)) {
+    throw new CourseFilePathError(
+      "A course file path cannot contain percent-encoded path separators (%2f or %5c).",
+    );
+  }
 
   // `..` is rejected rather than resolved. Resolving it would mean deciding what a traversal
   // that lands back inside the course directory ought to do, and there is no such path worth
@@ -127,10 +132,10 @@ function toHostRelativePath(raw: string, host: string): string {
  * repeatedly until it stops changing rather than exactly once — `%252e%252e` is `%2e%2e` after
  * one pass and `..` after two. Malformed encoding fails to decode and is judged as it stands.
  */
-function isDotSegment(segment: string): boolean {
-  let value = segment;
+function anyDecodePass(input: string, predicate: (value: string) => boolean): boolean {
+  let value = input;
   for (let pass = 0; pass < 4; pass += 1) {
-    if (value === "." || value === "..") return true;
+    if (predicate(value)) return true;
     if (!value.includes("%")) return false;
     let decoded: string;
     try {
@@ -141,7 +146,15 @@ function isDotSegment(segment: string): boolean {
     if (decoded === value) return false;
     value = decoded;
   }
-  return value === "." || value === "..";
+  return predicate(value);
+}
+
+function containsEncodedSeparator(path: string): boolean {
+  return anyDecodePass(path, (v) => /%2f|%5c/i.test(v));
+}
+
+function isDotSegment(segment: string): boolean {
+  return anyDecodePass(segment, (v) => v === "." || v === "..");
 }
 
 function stripQuery(path: string): string {

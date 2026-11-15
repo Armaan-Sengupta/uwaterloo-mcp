@@ -22,7 +22,7 @@ import {
   type ContentItem,
   type Quiz,
 } from "./d2l/coursework.js";
-import { getUpcoming, type Deadline } from "./d2l/upcoming.js";
+import { getUpcoming, listAllDeadlines, type Deadline } from "./d2l/upcoming.js";
 import { getClasslist, type ClassMember } from "./d2l/classlist.js";
 import {
   getAttemptDetail,
@@ -49,7 +49,15 @@ import {
   getTopicFileMetadata,
 } from "./d2l/files.js";
 import { resolveCourseFilePath } from "./d2l/coursePaths.js";
-import { getSubmissionHistory, resolveDropboxFolder } from "./d2l/submissions.js";
+import {
+  getDropboxReceipts,
+  getSubmissionHistory,
+  resolveDropboxFolder,
+  type DropboxReceipt,
+} from "./d2l/submissions.js";
+import { diffDueDateSnapshots } from "./d2l/dueDateDiff.js";
+import { calendarToken, generateDueDatesIcs } from "./d2l/ics.js";
+import { sessionStore, syncSession } from "./sessionStore.js";
 import { resolveQuickLink } from "./d2l/quicklinks.js";
 import { listPageLinks, type PageLink } from "./d2l/pageLinks.js";
 import { getAssignmentFeedback, type AssignmentFeedback } from "./d2l/feedback.js";
@@ -85,6 +93,9 @@ import {
   getSubmissionFileOutput,
   getSubmissionFileUrlOutput,
   getSubmissionsOutput,
+  getDropboxReceiptsOutput,
+  getDueDateChangesOutput,
+  exportDueDatesIcsOutput,
   getUpcomingOutput,
   listAssignmentsOutput,
   listCoursesOutput,
@@ -115,6 +126,7 @@ const COURSE_TOOL_NAMES = [
   "get_rubric_definition",
   "list_assignments",
   "get_submissions",
+  "get_dropbox_receipts",
   "get_submission_file",
   "get_submission_file_url",
   "get_course_content",
@@ -131,6 +143,8 @@ const COURSE_TOOL_NAMES = [
   "get_discussion_thread",
   "get_announcements",
   "get_upcoming",
+  "get_due_date_changes",
+  "export_due_dates_ics",
 ] as const;
 
 /** Argument accepted wherever a tool needs a course. */
@@ -218,6 +232,9 @@ export function registerLearnTools(
   registerDiscussions(server, client, course);
   registerAnnouncements(server, client, course);
   registerUpcoming(server, client);
+  registerDropboxReceipts(server, client, course);
+  registerDueDateChanges(server, client, config);
+  registerExportDueDatesIcs(server, client, config);
 }
 
 // ------------------------------------------------------- get_rubric_definition
@@ -441,6 +458,27 @@ function registerPageLinks(server: McpServer, client: D2LClient, course: CourseR
             `Topic ${topic_id} has no file behind it, so there is no page to read. ` +
               "Modules and links have no content of their own.",
           );
+        }
+
+        // Link topics (ActivityType === 2) point outside Brightspace HTML content: classify without fetching.
+        if (topic.ActivityType === 2) {
+          const linkRecord: PageLink = {
+            kind: "external",
+            label: topic.Title?.trim() || pagePath,
+            path: null,
+            url: pagePath,
+            linkType: null,
+            code: null,
+          };
+          return {
+            text: renderPageLinks(target.name, topic.Title ?? String(topic_id), pagePath, [linkRecord]),
+            data: {
+              course: { id: target.id, name: target.name },
+              topicId: topic_id,
+              pagePath,
+              links: [linkRecord],
+            },
+          };
         }
 
         const links = await listPageLinks(client, target.id, pagePath);
@@ -747,6 +785,9 @@ function registerServerInfo(
         config.piazza
           ? "Piazza: configured. All Piazza tools are available."
           : "Piazza: NOT configured. Set PIAZZA_EMAIL and PIAZZA_PASSWORD to enable Piazza tools.",
+        config.crowdmark
+          ? "Crowdmark: configured. Read-only Crowdmark tools are available."
+          : "Crowdmark: NOT configured. Add your Crowdmark cookie in /setup or set CROWDMARK_COOKIE.",
         "",
       ];
 
@@ -771,6 +812,7 @@ function registerServerInfo(
               signedInAs: null,
             },
             piazza: { configured: config.piazza !== null },
+            crowdmark: { configured: config.crowdmark !== null },
           },
         } as never;
       }
@@ -810,6 +852,7 @@ function registerServerInfo(
             signedInAs,
           },
           piazza: { configured: config.piazza !== null },
+          crowdmark: { configured: config.crowdmark !== null },
         },
       } as never;
     },
@@ -2299,4 +2342,239 @@ function renderDeadline(d: Deadline): string {
     `  ${d.courseName}`,
     `  due: ${formatDate(d.dueDate)}${d.submitted === true ? "   SUBMITTED" : ""}${d.outOf !== null ? `   out of ${d.outOf}` : ""}`,
   ].join("\n");
+}
+
+// --------------------------------------------------------- get_dropbox_receipts
+
+function registerDropboxReceipts(
+  server: McpServer,
+  client: D2LClient,
+  course: CourseResolver,
+): void {
+  server.registerTool(
+    "get_dropbox_receipts",
+    {
+      title: "Get assignment submission receipts",
+      description:
+        "Returns read-only dropbox submission receipts (course, folder, submitted timestamp, " +
+        "submitter, uploaded files, and whether the attempt was late) across all courses or for " +
+        "a single course/folder.",
+      inputSchema: z.object({
+        course: courseArg.optional().describe("Optional course code, name, or id. Omit to scan all active courses."),
+        assignment: z
+          .string()
+          .optional()
+          .describe("Optional assignment name or id (when `course` is given) to filter to one folder."),
+      }),
+      outputSchema: getDropboxReceiptsOutput,
+      annotations: { readOnlyHint: true, openWorldHint: false },
+    },
+    async ({ course: courseRef, assignment }) =>
+      guardStructured<z.infer<typeof getDropboxReceiptsOutput>>(async () => {
+        let courseId: number | undefined;
+        let folderId: number | undefined;
+        if (courseRef) {
+          const target = await course(courseRef);
+          courseId = target.id;
+          if (assignment) {
+            const folder = await resolveDropboxFolder(client, target.id, assignment);
+            folderId = folder.Id;
+          }
+        }
+
+        const { receipts, failures } = await getDropboxReceipts(client, { courseId, folderId });
+        const data: z.infer<typeof getDropboxReceiptsOutput> = {
+          receipts: receipts.map((r) => ({
+            courseId: r.courseId,
+            courseName: r.courseName,
+            folderId: r.folderId,
+            folderName: r.folderName,
+            submissionId: r.submissionId,
+            attemptNumber: r.attemptNumber,
+            submittedAt: r.submittedAt,
+            submitter: r.submitter,
+            dueDate: r.dueDate,
+            isLate: r.isLate,
+            lateByMinutes: r.lateByMinutes,
+            files: r.files.map((f) => ({ id: f.id, name: f.name, size: f.size })),
+          })),
+          failures,
+        };
+
+        if (receipts.length === 0) {
+          return {
+            text:
+              failures.length > 0
+                ? `No submission receipts found. Note: ${failures.join("; ")}.`
+                : "No submission receipts found.",
+            data,
+          };
+        }
+
+        const lines = [`Submission receipts (${receipts.length}):`, ""];
+        for (const r of receipts) {
+          lines.push(renderReceipt(r));
+        }
+        if (failures.length > 0) {
+          lines.push("", `Note: ${failures.join("; ")}.`);
+        }
+        return { text: lines.join("\n"), data };
+      }),
+  );
+}
+
+function renderReceipt(r: DropboxReceipt): string {
+  const lateLabel =
+    r.isLate === true
+      ? `LATE (${r.lateByMinutes ?? "?"} min)`
+      : r.isLate === false
+        ? "on time"
+        : "no due date";
+  const files = r.files.map((f) => f.name).join(", ") || "(no files)";
+  return [
+    `${r.courseName} — ${r.folderName} (attempt #${r.attemptNumber}, receipt id ${r.submissionId})`,
+    `  submitted: ${r.submittedAt ? formatDate(r.submittedAt) : "unknown"} by ${r.submitter} [${lateLabel}]`,
+    `  files: ${files}`,
+  ].join("\n");
+}
+
+// --------------------------------------------------------- get_due_date_changes
+
+function registerDueDateChanges(
+  server: McpServer,
+  client: D2LClient,
+  config: Config,
+): void {
+  server.registerTool(
+    "get_due_date_changes",
+    {
+      title: "Detect LEARN due-date changes since last snapshot",
+      description:
+        "Snapshots all active course assignment and quiz due dates, compares them against the " +
+        "previous saved snapshot, reports added/changed/removed deadlines, and saves the new " +
+        "snapshot.",
+      inputSchema: z.object({}),
+      outputSchema: getDueDateChangesOutput,
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    async () =>
+      guardStructured<z.infer<typeof getDueDateChangesOutput>>(async () => {
+        await syncSession(config);
+        const store = sessionStore(config);
+        const existing = await store.current();
+        const previousSnapshot = existing?.dueDateSnapshot ?? null;
+
+        const { deadlines, failures } = await listAllDeadlines(client);
+        const { result: diff, nextSnapshot } = diffDueDateSnapshots(previousSnapshot, deadlines);
+
+        // Avoid losing track of temporarily failing courses when a partial read happens.
+        if (failures.length === 0 || !previousSnapshot) {
+          await store.update({ dueDateSnapshot: nextSnapshot });
+        }
+
+        const data: z.infer<typeof getDueDateChangesOutput> = {
+          initialized: diff.initialized,
+          previousSnapshotAt: diff.previousCapturedAt,
+          capturedAt: nextSnapshot.capturedAt,
+          trackedCount: nextSnapshot.items.length,
+          changes: diff.changes.map((c) => ({
+            key: `${c.courseId}:${c.kind}:${c.id}`,
+            ...c,
+          })),
+          failures,
+        };
+
+        const lines: string[] = [];
+        if (diff.initialized) {
+          lines.push(
+            `Initialized due-date snapshot with ${nextSnapshot.items.length} dated items across your courses.`,
+          );
+        } else if (diff.changes.length === 0) {
+          lines.push(
+            `No due-date changes since ${diff.previousCapturedAt} (${nextSnapshot.items.length} tracked items).`,
+          );
+        } else {
+          lines.push(
+            `Detected ${diff.changes.length} due-date change(s) since ${diff.previousCapturedAt}:`,
+            "",
+          );
+          for (const c of diff.changes) {
+            const desc =
+              c.changeType === "changed"
+                ? `${c.previousDueDate ?? "unset"} -> ${c.newDueDate ?? "unset"}`
+                : c.changeType === "added"
+                  ? `added (due ${c.newDueDate ?? "unset"})`
+                  : `removed (was ${c.previousDueDate ?? "unset"})`;
+            lines.push(`- [${c.changeType}] ${c.courseName}: ${c.name} (${desc})`);
+          }
+        }
+        if (failures.length > 0) {
+          lines.push("", `Note: partial read (${failures.join("; ")}); snapshot not overwritten.`);
+        }
+
+        return { text: lines.join("\n"), data };
+      }),
+  );
+}
+
+// --------------------------------------------------------- export_due_dates_ics
+
+function registerExportDueDatesIcs(
+  server: McpServer,
+  client: D2LClient,
+  config: Config,
+): void {
+  server.registerTool(
+    "export_due_dates_ics",
+    {
+      title: "Export LEARN due dates as ICS calendar",
+      description:
+        "Generates an RFC 5545 .ics iCalendar payload for upcoming LEARN assignments and quizzes " +
+        "that can be imported into or subscribed to from Google Calendar without an API key.",
+      inputSchema: z.object({
+        days: z.number().int().min(1).max(365).optional().describe("Lookahead window in days (defaults to 60)."),
+        include_submitted: z
+          .boolean()
+          .optional()
+          .describe("Include assignments already marked submitted (defaults to true)."),
+      }),
+      outputSchema: exportDueDatesIcsOutput,
+      annotations: { readOnlyHint: true, openWorldHint: false },
+    },
+    async ({ days = 60, include_submitted = true }) =>
+      guardStructured<z.infer<typeof exportDueDatesIcsOutput>>(async () => {
+        const { deadlines, courses, failures } = await getUpcoming(client, {
+          withinDays: days,
+          includeSubmitted: include_submitted,
+          includeOverdue: true,
+        });
+        const ics = generateDueDatesIcs(deadlines, { d2lHost: config.d2lHost });
+        const subscriptionUrl =
+          config.publicUrl && config.authToken
+            ? `${config.publicUrl.replace(/\/+$/, "")}/calendar.ics?token=${encodeURIComponent(calendarToken(config.authToken))}`
+            : null;
+
+        const summaryLines = [
+          `Generated RFC 5545 ICS with ${deadlines.length} event(s) across ${courses.length} course(s) (next ${days} days).`,
+        ];
+        if (subscriptionUrl) {
+          summaryLines.push(`Subscription URL (Google Calendar -> Add by URL): ${subscriptionUrl}`);
+        }
+        if (failures.length > 0) {
+          summaryLines.push(`Note: ${failures.join("; ")}.`);
+        }
+        summaryLines.push("", ics);
+
+        return {
+          text: summaryLines.join("\n"),
+          data: {
+            ics,
+            eventCount: deadlines.length,
+            coursesChecked: courses.length,
+            subscriptionUrl,
+            failures,
+          },
+        };
+      }),
+  );
 }

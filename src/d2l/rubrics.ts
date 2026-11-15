@@ -22,7 +22,11 @@
  * make one gradebook lookup cost dozens of round trips.
  */
 
-import type { D2LClient } from "./client.js";
+import {
+  type D2LClient,
+  fetchBrightspaceJson,
+  isAllowedBrightspaceApiUrl,
+} from "./client.js";
 import { richText, truncate } from "./format.js";
 
 /** EVAL_T values, as they appear in the popup URL. */
@@ -104,15 +108,10 @@ export async function fetchGradedRubric(
   client: D2LClient,
   assessmentHref: string,
 ): Promise<GradedRubric | null> {
+  if (!isAllowedBrightspaceApiUrl(assessmentHref, client.host)) return null;
   const bearer = await client.getBearerToken();
-  const get = async (url: string): Promise<SirenEntity | null> => {
-    const response = await fetch(url, {
-      headers: { Accept: "application/json", Authorization: `Bearer ${bearer}` },
-      signal: AbortSignal.timeout(15_000),
-    }).catch(() => null);
-    if (!response?.ok) return null;
-    return (await response.json().catch(() => null)) as SirenEntity | null;
-  };
+  const get = (url: string): Promise<SirenEntity | null> =>
+    fetchBrightspaceJson<SirenEntity>(url, client.host, bearer);
 
   const root = await get(assessmentHref);
   if (!root) return null;

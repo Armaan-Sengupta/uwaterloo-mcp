@@ -23,18 +23,11 @@ export interface Deadline {
   outOf: number | null;
 }
 
-export async function getUpcoming(
+/** Fetches all dated assignments and quizzes across active courses without time-window filtering. */
+export async function listAllDeadlines(
   client: D2LClient,
-  options: { withinDays?: number; includeSubmitted?: boolean; includeOverdue?: boolean } = {},
 ): Promise<{ deadlines: Deadline[]; courses: Course[]; failures: string[] }> {
-  const withinDays = options.withinDays ?? 14;
   const courses = await listCourses(client);
-
-  const now = Date.now();
-  const horizon = now + withinDays * 24 * 60 * 60 * 1000;
-  // A little slack behind "now" so something that closed hours ago still shows as overdue.
-  const floor = options.includeOverdue === false ? now : now - 7 * 24 * 60 * 60 * 1000;
-
   const failures: string[] = [];
 
   // One course failing — a permissions quirk, a tool the instructor disabled — must not lose
@@ -90,15 +83,32 @@ export async function getUpcoming(
 
   const deadlines = perCourse
     .flat()
-    .filter((d) => {
-      const at = Date.parse(d.dueDate);
-      if (Number.isNaN(at) || at < floor || at > horizon) return false;
-      // Only hide work D2L positively confirms was submitted. An unknown stays visible: a
-      // missed deadline is far more costly than a redundant reminder.
-      if (!options.includeSubmitted && d.submitted === true) return false;
-      return true;
-    })
+    .filter((d) => !Number.isNaN(Date.parse(d.dueDate)))
     .sort((a, b) => Date.parse(a.dueDate) - Date.parse(b.dueDate));
+
+  return { deadlines, courses, failures };
+}
+
+export async function getUpcoming(
+  client: D2LClient,
+  options: { withinDays?: number; includeSubmitted?: boolean; includeOverdue?: boolean } = {},
+): Promise<{ deadlines: Deadline[]; courses: Course[]; failures: string[] }> {
+  const withinDays = options.withinDays ?? 14;
+  const { deadlines: all, courses, failures } = await listAllDeadlines(client);
+
+  const now = Date.now();
+  const horizon = now + withinDays * 24 * 60 * 60 * 1000;
+  // A little slack behind "now" so something that closed hours ago still shows as overdue.
+  const floor = options.includeOverdue === false ? now : now - 7 * 24 * 60 * 60 * 1000;
+
+  const deadlines = all.filter((d) => {
+    const at = Date.parse(d.dueDate);
+    if (Number.isNaN(at) || at < floor || at > horizon) return false;
+    // Only hide work D2L positively confirms was submitted. An unknown stays visible: a
+    // missed deadline is far more costly than a redundant reminder.
+    if (!options.includeSubmitted && d.submitted === true) return false;
+    return true;
+  });
 
   return { deadlines, courses, failures };
 }

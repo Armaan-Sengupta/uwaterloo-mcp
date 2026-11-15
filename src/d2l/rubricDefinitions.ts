@@ -17,7 +17,11 @@
  * concrete, realistic and elaborative example" — so they are what this returns.
  */
 
-import type { D2LClient } from "./client.js";
+import {
+  type D2LClient,
+  fetchBrightspaceJson,
+  isAllowedBrightspaceApiUrl,
+} from "./client.js";
 import { richText } from "./format.js";
 
 export interface RubricLevelCell {
@@ -109,17 +113,11 @@ export async function fetchRubricDefinition(
 
   const rubricHref = /https:\/\/[a-z0-9-]+\.rubrics\.api\.brightspace\.com\/organizations\/\d+\/\d+/i
     .exec(html.split("\\/").join("/"))?.[0];
-  if (!rubricHref) return null;
+  if (!rubricHref || !isAllowedBrightspaceApiUrl(rubricHref, client.host)) return null;
 
   const bearer = await client.getBearerToken();
-  const get = async (url: string): Promise<SirenEntity | null> => {
-    const response = await fetch(url, {
-      headers: { Accept: "application/json", Authorization: `Bearer ${bearer}` },
-      signal: AbortSignal.timeout(15_000),
-    }).catch(() => null);
-    if (!response?.ok) return null;
-    return (await response.json().catch(() => null)) as SirenEntity | null;
-  };
+  const get = (url: string): Promise<SirenEntity | null> =>
+    fetchBrightspaceJson<SirenEntity>(url, client.host, bearer);
 
   const root = await get(rubricHref);
   if (!root) return null;

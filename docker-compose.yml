@@ -4,9 +4,11 @@ services:
     container_name: uwaterloo-mcp
     restart: unless-stopped
     ports:
-      - "8787:8787"
+      # Bind only to host loopback by default so /setup and /mcp are never exposed on LAN/WAN.
+      - "127.0.0.1:8787:8787"
     environment:
       - PORT=8787
+      # Container listens on 0.0.0.0 so Docker's 127.0.0.1:8787 port mapping can reach it.
       - HOST=0.0.0.0
       # Optional: specify an auth token, or let the server auto-generate one on startup
       # - MCP_AUTH_TOKEN=your-random-token-at-least-24-chars

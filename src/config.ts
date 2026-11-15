@@ -12,8 +12,10 @@ export const VERSION = "1.0.0";
 /** The current MCP specification revision. See SUPPORTED_PROTOCOL_VERSIONS in server.ts. */
 export const CURRENT_PROTOCOL_VERSION = "2026-07-28";
 
-/** Minimum length for MCP_AUTH_TOKEN. Short tokens are guessable and this is the only guard. */
+/** Minimum length for MCP_AUTH_TOKEN and SESSION_ENCRYPTION_KEY. */
 const MIN_TOKEN_LENGTH = 24;
+
+export const CROWDMARK_ALLOWED_HOSTS = new Set(["app.crowdmark.com", "crowdmark.com"]);
 
 export interface Config {
   port: number;
@@ -24,6 +26,13 @@ export interface Config {
   host: string;
   /** Bearer token required on /mcp. `null` means auth is explicitly disabled. */
   authToken: string | null;
+  /**
+   * Optional dedicated encryption secret for the SessionStore. When omitted, the key is derived
+   * from `authToken` for backward compatibility.
+   */
+  sessionEncryptionKey: string | null;
+  /** Optional secret required on cron triggers to /api/keep-alive. */
+  cronSecret: string | null;
   /**
    * Origin hostnames permitted by the DNS-rebinding check. Empty means the SDK's default
    * applies (localhost-only when bound locally; unrestricted when bound to 0.0.0.0, where the
@@ -56,12 +65,21 @@ export interface Config {
   waterloo: WaterlooCredentials | null;
   /** Piazza login used only by the Piazza client and never exposed through MCP. */
   piazza: PiazzaCredentials | null;
+  /** Base Crowdmark URL (strictly allowlisted to app.crowdmark.com / crowdmark.com). */
+  crowdmarkHost: string;
+  /** Crowdmark session cookie, when configured. */
+  crowdmark: CrowdmarkCredentials | null;
 }
 
 export interface D2LCredentials {
   host: string;
   cookie: string;
   csrfToken: string | undefined;
+}
+
+export interface CrowdmarkCredentials {
+  host: string;
+  cookie: string;
 }
 
 export interface WaterlooCredentials {
@@ -212,6 +230,38 @@ export function loadConfig(env: EnvLike): ConfigResult {
     );
   }
 
+  const sessionEncryptionKey = env.SESSION_ENCRYPTION_KEY?.replace(/[\r\n]+$/, "") || null;
+  if (sessionEncryptionKey && sessionEncryptionKey.length < MIN_TOKEN_LENGTH) {
+    problems.push(
+      `SESSION_ENCRYPTION_KEY is only ${sessionEncryptionKey.length} characters; use at least ${MIN_TOKEN_LENGTH}.`,
+    );
+  }
+
+  const cronSecret = env.CRON_SECRET?.replace(/[\r\n]+$/, "").trim() || null;
+  if (cronSecret && cronSecret.length < 16) {
+    warnings.push("CRON_SECRET is shorter than 16 characters; use a strong random value.");
+  }
+
+  const crowdmarkHost =
+    env.CROWDMARK_HOST?.trim().replace(/\/+$/, "") || "https://app.crowdmark.com";
+  let crowdmarkHostValid = false;
+  try {
+    const parsedCm = new URL(crowdmarkHost);
+    crowdmarkHostValid =
+      parsedCm.protocol === "https:" && CROWDMARK_ALLOWED_HOSTS.has(parsedCm.hostname.toLowerCase());
+  } catch {
+    crowdmarkHostValid = false;
+  }
+  if (!crowdmarkHostValid) {
+    problems.push(
+      `CROWDMARK_HOST must be https://app.crowdmark.com or https://crowdmark.com, got ${JSON.stringify(crowdmarkHost)}.`,
+    );
+  }
+
+  const crowdmarkCookie = env.CROWDMARK_COOKIE?.replace(/[\r\n]+$/, "").trim();
+  const crowdmark: CrowdmarkCredentials | null =
+    crowdmarkCookie && crowdmarkHostValid ? { host: crowdmarkHost, cookie: crowdmarkCookie } : null;
+
   if (publicUrl && !/^https?:\/\//.test(publicUrl)) {
     problems.push(`MCP_PUBLIC_URL must start with http:// or https://, got ${JSON.stringify(publicUrl)}.`);
   }
@@ -225,6 +275,8 @@ export function loadConfig(env: EnvLike): ConfigResult {
       port,
       host,
       authToken: authDisabled ? null : authToken!,
+      sessionEncryptionKey,
+      cronSecret,
       allowedOrigins,
       allowedHosts,
       publicUrl,
@@ -234,6 +286,8 @@ export function loadConfig(env: EnvLike): ConfigResult {
       d2lHost,
       waterloo,
       piazza,
+      crowdmarkHost,
+      crowdmark,
     },
   };
 }
