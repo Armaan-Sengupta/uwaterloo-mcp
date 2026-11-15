@@ -10,6 +10,7 @@ import {
   SUPPORTED_PROTOCOL_VERSIONS as SDK_DEFAULT_PROTOCOL_VERSIONS,
 } from "@modelcontextprotocol/server";
 import { CURRENT_PROTOCOL_VERSION, SERVER_NAME, VERSION, type Config } from "./config.js";
+import { CROWDMARK_TOOL_NAMES, registerCrowdmarkTools } from "./crowdmarkTools.js";
 import { registerLearnTools } from "./learnTools.js";
 import { PIAZZA_TOOL_NAMES, registerPiazzaTools } from "./piazzaTools.js";
 
@@ -32,7 +33,7 @@ export const SUPPORTED_PROTOCOL_VERSIONS = [
 ];
 
 const INSTRUCTIONS = [
-  "Read-only access to the user's UWaterloo Learn and Piazza accounts.",
+  "Read-only access to the user's UWaterloo Learn, Piazza, and Crowdmark accounts.",
   "",
   "Learn and Piazza are separate integrations. Use list_courses for Learn and",
   "piazza_list_courses for Piazza; never reuse one service's course identifier in the other.",
@@ -69,8 +70,12 @@ export function createServer(config: Config): McpServer {
     },
   );
 
-  const piazzaToolNames = config.piazza ? PIAZZA_TOOL_NAMES : [];
-  registerLearnTools(server, config, piazzaToolNames);
+  const additionalToolNames = [
+    ...(config.piazza ? PIAZZA_TOOL_NAMES : []),
+    ...CROWDMARK_TOOL_NAMES,
+  ];
+  registerLearnTools(server, config, additionalToolNames);
   if (config.piazza) registerPiazzaTools(server, config.piazza);
+  registerCrowdmarkTools(server, config);
   return server;
 }

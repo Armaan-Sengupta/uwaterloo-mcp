@@ -101,6 +101,81 @@ export class D2LAuthError extends D2LError {
   }
 }
 
+/**
+ * Resolves `input` against `host`, rejecting scheme-relative (`//`), credential-bearing,
+ * non-matching-protocol, or cross-origin URLs before any cookie is sent.
+ */
+export function resolveSameOriginUrl(host: string, input: string): string {
+  const base = new URL(host);
+  const trimmed = input.trim();
+  if (
+    !trimmed ||
+    /[\r\n\0]/.test(trimmed) ||
+    trimmed.startsWith("//") ||
+    trimmed.startsWith("\\\\") ||
+    trimmed.startsWith("/\\")
+  ) {
+    throw new D2LError("Refusing ambiguous or scheme-relative D2L URL.", 400, input);
+  }
+
+  let target: URL;
+  try {
+    target = /^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(trimmed)
+      ? new URL(trimmed)
+      : new URL(trimmed.startsWith("/") ? trimmed : `/${trimmed}`, base);
+  } catch {
+    throw new D2LError("Invalid D2L request URL.", 400, input);
+  }
+
+  if (target.username || target.password) {
+    throw new D2LError("Refusing URL containing embedded credentials.", 400, input);
+  }
+  if (target.origin !== base.origin) {
+    throw new D2LError(
+      `Refusing cross-origin request to ${target.origin}; only ${base.origin} is allowed.`,
+      400,
+      target.toString(),
+    );
+  }
+  return target.toString();
+}
+
+/**
+ * Allows Brightspace Bearer tokens to be sent only to `d2lHost` or HTTPS `*.brightspace.com`
+ * subdomains (e.g., Siren rubrics APIs). Rejects embedded credentials and arbitrary hosts.
+ */
+export function isAllowedBrightspaceApiUrl(rawUrl: string, d2lHost: string): boolean {
+  let url: URL;
+  let base: URL;
+  try {
+    url = new URL(rawUrl);
+    base = new URL(d2lHost);
+  } catch {
+    return false;
+  }
+  if (url.username || url.password) return false;
+  if (url.origin === base.origin) return true;
+  if (url.protocol !== "https:") return false;
+  const hostname = url.hostname.toLowerCase();
+  return hostname === "brightspace.com" || hostname.endsWith(".brightspace.com");
+}
+
+/** Fetches a Brightspace Siren/JSON endpoint with a Bearer token only after host allowlist checks. */
+export async function fetchBrightspaceJson<T>(
+  url: string,
+  d2lHost: string,
+  bearer: string,
+): Promise<T | null> {
+  if (!isAllowedBrightspaceApiUrl(url, d2lHost)) return null;
+  const response = await fetch(url, {
+    headers: { Accept: "application/json", Authorization: `Bearer ${bearer}` },
+    redirect: "error",
+    signal: AbortSignal.timeout(15_000),
+  }).catch(() => null);
+  if (!response?.ok) return null;
+  return (await response.json().catch(() => null)) as T | null;
+}
+
 export class D2LClient {
   /**
    * Cached per instance, which on serverless means per request. Both are cheap to re-fetch and
@@ -172,7 +247,7 @@ export class D2LClient {
    * the caller gets a clear message instead of a JSON parse error.
    */
   async request<T>(path: string, init: RequestInit = {}): Promise<T> {
-    const url = `${this.config.host}${path}`;
+    const url = resolveSameOriginUrl(this.config.host, path);
     // Tools stay registered before anyone has signed in, so that they can say this rather than
     // vanish from the tool list and leave the assistant guessing why.
     if (!this.config.cookie) throw new D2LSignedOutError(url, this.config.setupUrl);
@@ -287,56 +362,175 @@ export class D2LClient {
    * same auth and the same treatment of a login redirect, and hands back the raw response.
    */
   async fetchRaw(path: string): Promise<Response> {
-    const url = `${this.config.host}${path}`;
-    const response = await fetch(url, {
-      headers: {
-        Cookie: this.config.cookie,
+    const baseOrigin = new URL(this.config.host).origin;
+    let currentUrl = resolveSameOriginUrl(this.config.host, path);
+    if (!this.config.cookie) throw new D2LSignedOutError(currentUrl, this.config.setupUrl);
+
+    let response: Response | undefined;
+    for (let hops = 0; hops < 6; hops++) {
+      const sameOrigin = new URL(currentUrl).origin === baseOrigin;
+      const headers: Record<string, string> = {
         "User-Agent": `uwaterloo-mcp (MCP ${CURRENT_PROTOCOL_VERSION})`,
-      },
-      // Files redirect to a storage path, so redirects are followed — but a redirect to the
-      // sign-in page means the session is dead, which the content type check below catches.
-      redirect: "follow",
-      signal: AbortSignal.timeout(30_000),
-    });
+      };
+      if (sameOrigin) {
+        headers.Cookie = this.config.cookie;
+      }
+
+      response = await fetch(currentUrl, {
+        headers,
+        redirect: "manual",
+        signal: AbortSignal.timeout(30_000),
+      });
+
+      if (response.status >= 300 && response.status < 400) {
+        const location = response.headers.get("location");
+        if (!location) break;
+        const nextUrl = new URL(location, currentUrl);
+        if (nextUrl.username || nextUrl.password) {
+          throw new D2LError("Refusing redirect with embedded credentials.", 400, currentUrl);
+        }
+        if (nextUrl.origin === baseOrigin && /\/d2l\/login|saml|adfs\/ls/i.test(nextUrl.pathname)) {
+          await response.body?.cancel().catch(() => {});
+          throw new D2LAuthError(currentUrl, response.status, this.config.setupUrl);
+        }
+        if (nextUrl.protocol !== "https:" && nextUrl.origin !== baseOrigin) {
+          await response.body?.cancel().catch(() => {});
+          throw new D2LError(`Refusing insecure redirect to ${nextUrl.origin}.`, 400, currentUrl);
+        }
+        await response.body?.cancel().catch(() => {});
+        currentUrl = nextUrl.toString();
+        continue;
+      }
+      break;
+    }
+
+    if (!response) {
+      throw new D2LError("Too many redirects while fetching D2L file.", 502, currentUrl);
+    }
+    if (response.status >= 300 && response.status < 400) {
+      await response.body?.cancel().catch(() => {});
+      throw new D2LError("Too many redirects while fetching D2L file.", 502, currentUrl);
+    }
 
     if (response.status === 401 || response.status === 403) {
-      throw new D2LAuthError(url, response.status, this.config.setupUrl);
+      throw new D2LAuthError(currentUrl, response.status, this.config.setupUrl);
     }
     if (!response.ok) {
-      throw new D2LError(`D2L returned ${response.status} for the file.`, response.status, url);
+      throw new D2LError(`D2L returned ${response.status} for the file.`, response.status, currentUrl);
     }
     if ((response.headers.get("content-type") ?? "").includes("text/html")) {
       // HTML is also a legitimate course file type. Inspect a clone so the caller still gets
       // the original bytes, and reject only an actual sign-in page rather than every web page.
       const body = await response.clone().text();
-      if (looksLikeSignIn(body)) throw new D2LAuthError(url, response.status, this.config.setupUrl);
+      if (looksLikeSignIn(body)) throw new D2LAuthError(currentUrl, response.status, this.config.setupUrl);
     }
     return response;
   }
 
   /**
+   * Resolves same-origin redirects for a D2L quicklink without ever connecting to or sending
+   * cookies to third-party origins.
+   */
+  async resolveRedirectTarget(path: string): Promise<string> {
+    const baseOrigin = new URL(this.config.host).origin;
+    let currentUrl = resolveSameOriginUrl(this.config.host, path);
+    if (!this.config.cookie) throw new D2LSignedOutError(currentUrl, this.config.setupUrl);
+
+    for (let hops = 0; hops < 6; hops++) {
+      const response = await fetch(currentUrl, {
+        headers: {
+          Cookie: this.config.cookie,
+          "User-Agent": `uwaterloo-mcp (MCP ${CURRENT_PROTOCOL_VERSION})`,
+        },
+        redirect: "manual",
+        signal: AbortSignal.timeout(20_000),
+      });
+
+      if (response.status === 401 || response.status === 403) {
+        await response.body?.cancel().catch(() => {});
+        throw new D2LAuthError(currentUrl, response.status, this.config.setupUrl);
+      }
+
+      if (response.status >= 300 && response.status < 400) {
+        const location = response.headers.get("location");
+        await response.body?.cancel().catch(() => {});
+        if (!location) return currentUrl;
+        const nextUrl = new URL(location, currentUrl);
+        if (nextUrl.origin === baseOrigin && /\/d2l\/login|saml|adfs\/ls/i.test(nextUrl.pathname)) {
+          throw new D2LAuthError(currentUrl, response.status, this.config.setupUrl);
+        }
+        if (nextUrl.origin !== baseOrigin) {
+          // Return the external target URL directly without requesting it.
+          return nextUrl.toString();
+        }
+        currentUrl = resolveSameOriginUrl(this.config.host, nextUrl.toString());
+        continue;
+      }
+
+      if (!response.ok) {
+        await response.body?.cancel().catch(() => {});
+        throw new D2LError(`D2L returned ${response.status} for the link.`, response.status, currentUrl);
+      }
+
+      if ((response.headers.get("content-type") ?? "").includes("text/html")) {
+        const body = await response.text();
+        if (looksLikeSignIn(body)) throw new D2LAuthError(currentUrl, response.status, this.config.setupUrl);
+      } else {
+        await response.body?.cancel().catch(() => {});
+      }
+      return response.url || currentUrl;
+    }
+
+    throw new D2LError("Too many redirects while resolving D2L link.", 502, currentUrl);
+  }
+
+  /**
    * Fetches a Brightspace page as text.
    *
-   * Some things the UI shows have no API a student can reach — a graded rubric, for one — and
-   * the only route to them is the page the browser opens. Kept separate from `request` so the
-   * JSON path stays strict about content types.
+   * Strictly constrained to `this.config.host` both before requesting and across redirects so
+   * cookies are never sent to arbitrary origins.
    */
   async fetchText(path: string): Promise<string> {
-    const url = path.startsWith("http") ? path : `${this.config.host}${path}`;
-    const response = await fetch(url, {
-      headers: {
-        Cookie: this.config.cookie,
-        "User-Agent": `uwaterloo-mcp (MCP ${CURRENT_PROTOCOL_VERSION})`,
-      },
-      redirect: "follow",
-      signal: AbortSignal.timeout(20_000),
-    });
+    let currentUrl = resolveSameOriginUrl(this.config.host, path);
+    if (!this.config.cookie) throw new D2LSignedOutError(currentUrl, this.config.setupUrl);
+
+    let response: Response | undefined;
+    for (let hops = 0; hops < 6; hops++) {
+      response = await fetch(currentUrl, {
+        headers: {
+          Cookie: this.config.cookie,
+          "User-Agent": `uwaterloo-mcp (MCP ${CURRENT_PROTOCOL_VERSION})`,
+        },
+        redirect: "manual",
+        signal: AbortSignal.timeout(20_000),
+      });
+
+      if (response.status >= 300 && response.status < 400) {
+        const location = response.headers.get("location");
+        await response.body?.cancel().catch(() => {});
+        if (!location) break;
+        const nextUrl = new URL(location, currentUrl);
+        if (/\/d2l\/login|saml|adfs\/ls/i.test(nextUrl.pathname) && nextUrl.origin === new URL(this.config.host).origin) {
+          throw new D2LAuthError(currentUrl, response.status, this.config.setupUrl);
+        }
+        currentUrl = resolveSameOriginUrl(this.config.host, nextUrl.toString());
+        continue;
+      }
+      break;
+    }
+
+    if (!response || (response.status >= 300 && response.status < 400)) {
+      throw new D2LError("Too many redirects while fetching D2L page.", 502, currentUrl);
+    }
+    if (response.status === 401 || response.status === 403) {
+      throw new D2LAuthError(currentUrl, response.status, this.config.setupUrl);
+    }
     if (!response.ok) {
-      throw new D2LError(`D2L returned ${response.status}.`, response.status, url);
+      throw new D2LError(`D2L returned ${response.status}.`, response.status, currentUrl);
     }
     const body = await response.text();
     if (looksLikeSignIn(body)) {
-      throw new D2LAuthError(url, response.status, this.config.setupUrl);
+      throw new D2LAuthError(currentUrl, response.status, this.config.setupUrl);
     }
     return body;
   }

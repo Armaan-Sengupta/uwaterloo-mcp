@@ -12,7 +12,7 @@
  * otherwise has to make by scraping HTML themselves.
  */
 
-import type { D2LClient } from "./client.js";
+import { type D2LClient, D2LError } from "./client.js";
 
 export type PageLinkKind = "file" | "quicklink" | "internal" | "external";
 
@@ -35,14 +35,47 @@ export interface PageLink {
  * `pagePath` is the topic's own `/content/enforced/...` URL, which is also what relative hrefs
  * inside the page resolve against — a page linking `../../media/x.docx` means a path relative
  * to itself, and without the page's own location that link cannot be turned into a usable one.
+ *
+ * External URLs are classified directly without issuing a network request so D2L cookies are
+ * never transmitted to third-party origins.
  */
 export async function listPageLinks(
   client: D2LClient,
   courseId: number,
   pagePath: string,
 ): Promise<PageLink[]> {
-  const html = await client.fetchText(pagePath);
-  return extractLinks(html, courseId, pagePath);
+  const trimmed = pagePath.trim();
+  if (!trimmed || trimmed.startsWith("//") || trimmed.startsWith("\\\\")) {
+    throw new D2LError("Refusing ambiguous or scheme-relative page path.", 400, pagePath);
+  }
+
+  if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(trimmed)) {
+    let parsed: URL;
+    try {
+      parsed = new URL(trimmed);
+    } catch {
+      throw new D2LError("Invalid page URL.", 400, pagePath);
+    }
+    if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+      throw new D2LError(`Unsupported URL scheme '${parsed.protocol}'.`, 400, pagePath);
+    }
+    const baseOrigin = new URL(client.host).origin;
+    if (parsed.origin !== baseOrigin) {
+      return [
+        {
+          kind: "external",
+          label: parsed.toString(),
+          path: null,
+          url: parsed.toString(),
+          linkType: null,
+          code: null,
+        },
+      ];
+    }
+  }
+
+  const html = await client.fetchText(trimmed);
+  return extractLinks(html, courseId, trimmed);
 }
 
 /** Pure half of the above, so the parsing can be exercised without a session. */

@@ -25,6 +25,7 @@ import { createCipheriv, createDecipheriv, createHash, randomBytes } from "node:
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { Config, PiazzaCredentials, WaterlooCredentials } from "./config.js";
+import type { DueDateSnapshot } from "./d2l/dueDateDiff.js";
 
 const BLOB_PATHNAME = "uwaterloo-mcp/learn-session.bin";
 const RECORD_VERSION = 1;
@@ -64,6 +65,16 @@ export interface SessionRecord {
   keepAlive?: boolean | undefined;
   /** Timestamp (ms) of the last successful session keep-alive ping. */
   lastPingAt?: number | undefined;
+  /** Timestamp (ms) of the last keep-alive attempt (success or failure). */
+  lastAttemptAt?: number | undefined;
+  /** Number of consecutive keep-alive failures since the last success. */
+  consecutiveFailures?: number | undefined;
+  /** Diagnostic message from the last failed keep-alive attempt. */
+  lastPingError?: string | undefined;
+  /** Crowdmark session cookie header, when configured via /setup. */
+  crowdmarkCookie?: string | undefined;
+  /** Last snapshot of LEARN assignment/quiz due dates for change detection. */
+  dueDateSnapshot?: DueDateSnapshot | undefined;
 }
 
 export type StoreKind = "blob" | "file" | "memory";
@@ -75,7 +86,6 @@ interface Backend {
 }
 
 function blobBackend(token?: string): Backend {
-  let detectedAccess: "private" | "public" = "private";
   const tokenOpt = token ? { token } : {};
   return {
     kind: "blob",
@@ -87,27 +97,14 @@ function blobBackend(token?: string): Backend {
       const match = blobs.find((b) => b.pathname === BLOB_PATHNAME) ?? blobs[0];
       if (!match) return null;
 
-      const access: "private" | "public" = match.url.includes(".private.blob.")
-        ? "private"
-        : "public";
-      detectedAccess = access;
-
       try {
-        const result = await get(match.url, { access, useCache: false, ...tokenOpt });
+        const result = await get(match.url, { access: "private", useCache: false, ...tokenOpt });
         if (!result) return null;
         if (result.stream) {
           return Buffer.from(await new Response(result.stream).arrayBuffer());
         }
       } catch (err) {
         if (err instanceof BlobNotFoundError) return null;
-      }
-
-      if (access === "public") {
-        const res = await fetch(match.downloadUrl || match.url, {
-          headers: { "Cache-Control": "no-cache" },
-        });
-        if (res.status === 404) return null;
-        if (res.ok) return Buffer.from(await res.arrayBuffer());
       }
 
       const signed = await issueSignedToken({
@@ -117,7 +114,7 @@ function blobBackend(token?: string): Backend {
       });
       const { presignedUrl } = await presignUrl(signed, {
         pathname: match.pathname,
-        access,
+        access: "private",
         operation: "get",
         useCache: false,
       });
@@ -132,25 +129,14 @@ function blobBackend(token?: string): Backend {
     },
     async write(data) {
       const { put } = await import("@vercel/blob");
-      try {
-        await put(BLOB_PATHNAME, data, {
-          access: detectedAccess,
-          addRandomSuffix: false,
-          allowOverwrite: true,
-          contentType: "application/octet-stream",
-          ...tokenOpt,
-        });
-      } catch {
-        const altAccess = detectedAccess === "private" ? "public" : "private";
-        await put(BLOB_PATHNAME, data, {
-          access: altAccess,
-          addRandomSuffix: false,
-          allowOverwrite: true,
-          contentType: "application/octet-stream",
-          ...tokenOpt,
-        });
-        detectedAccess = altAccess;
-      }
+      // Always fail closed on private storage: never fall back to access: "public".
+      await put(BLOB_PATHNAME, data, {
+        access: "private",
+        addRandomSuffix: false,
+        allowOverwrite: true,
+        contentType: "application/octet-stream",
+        ...tokenOpt,
+      });
     },
   };
 }
@@ -208,7 +194,10 @@ function chooseBackend(env: Record<string, string | undefined>): Backend {
   // Serverless filesystems are read-only, or private to one short-lived instance — a file
   // there would look like persistence while being exactly as forgetful as memory.
   if (env.VERCEL) return memoryBackend();
-  return fileBackend(path.resolve(env.LEARN_SESSION_FILE?.trim() || ".learn-session"));
+  const sessionFile =
+    env.LEARN_SESSION_FILE?.trim() ||
+    (env.DATA_DIR?.trim() ? path.join(env.DATA_DIR.trim(), ".learn-session") : ".learn-session");
+  return fileBackend(path.resolve(sessionFile));
 }
 
 function keyFor(secret: string): Buffer {
@@ -317,13 +306,18 @@ export class SessionStore {
 /** One store per config object — i.e. per process, since a config is built once at boot. */
 const stores = new WeakMap<Config, SessionStore>();
 
+export function deriveSessionStoreKey(secret: string): Buffer {
+  return keyFor(secret);
+}
+
 export function sessionStore(config: Config): SessionStore {
   let store = stores.get(config);
   if (!store) {
-    // Without an access token there is nothing secret to derive a key from. That is the
-    // explicitly unauthenticated local-testing mode, so memory is the honest choice.
-    store = config.authToken
-      ? new SessionStore(chooseBackend(process.env), keyFor(config.authToken))
+    // Prefer dedicated SESSION_ENCRYPTION_KEY when set; fall back to MCP_AUTH_TOKEN for
+    // backward compatibility. Without either secret, run in memory-only local testing mode.
+    const keyMaterial = config.sessionEncryptionKey ?? config.authToken;
+    store = keyMaterial
+      ? new SessionStore(chooseBackend(process.env), keyFor(keyMaterial))
       : new SessionStore(memoryBackend(), keyFor(""));
     stores.set(config, store);
   }
@@ -342,11 +336,20 @@ export async function syncSession(config: Config, force = false): Promise<void> 
   const record = await sessionStore(config).current(force);
   if (!record) return;
 
-  if (record.cookie && (force || record.savedAt > adoptedSavedAt || !config.d2l)) {
+  const isNewer = record.savedAt > adoptedSavedAt;
+
+  if (record.cookie && (force || isNewer || !config.d2l)) {
     if (config.d2l?.cookie !== record.cookie) {
       config.d2l = { host: config.d2lHost, cookie: record.cookie, csrfToken: undefined };
     }
-    adoptedSavedAt = Math.max(adoptedSavedAt, record.savedAt);
+  }
+
+  if (record.crowdmarkCookie && (force || isNewer || !config.crowdmark)) {
+    if (config.crowdmark?.cookie !== record.crowdmarkCookie) {
+      config.crowdmark = { host: config.crowdmarkHost, cookie: record.crowdmarkCookie };
+    }
+  } else if (!record.crowdmarkCookie && !process.env.CROWDMARK_COOKIE) {
+    config.crowdmark = null;
   }
 
   if (record.piazza) {
@@ -354,6 +357,8 @@ export async function syncSession(config: Config, force = false): Promise<void> 
   } else if (!process.env.PIAZZA_EMAIL) {
     config.piazza = null;
   }
+
+  adoptedSavedAt = Math.max(adoptedSavedAt, record.savedAt);
 }
 
 /** The WatIAM login to sign in with: the environment's, else one saved from /setup. */

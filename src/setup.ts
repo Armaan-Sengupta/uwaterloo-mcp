@@ -70,10 +70,15 @@ export interface PageState {
   session?: SessionSnapshot | undefined;
   piazzaConfigured: boolean;
   piazzaEmail?: string | undefined;
+  crowdmarkConfigured?: boolean | undefined;
+  crowdmarkAlive?: boolean | undefined;
+  crowdmarkUser?: string | null | undefined;
   serverUrl?: string | undefined;
   authToken?: string | undefined;
+  calendarUrl?: string | undefined;
   keepAliveEnabled?: boolean | undefined;
   lastPingAt?: number | undefined;
+  lastPingError?: string | undefined;
   message?: { kind: "error" | "success"; text: string } | undefined;
   tokenEcho?: string | undefined;
 }
@@ -170,7 +175,13 @@ export function setupPage(state: PageState): string {
         <span class="dot"></span>
         Piazza: <strong>${state.piazzaConfigured ? `Connected (${escapeHtml(state.piazzaEmail ?? "")})` : "Not configured"}</strong>
       </div>
+      <div class="pill ${state.crowdmarkConfigured ? (state.crowdmarkAlive === false ? "warn" : "ok") : "off"}">
+        <span class="dot"></span>
+        Crowdmark: <strong>${state.crowdmarkConfigured ? (state.crowdmarkAlive === false ? "Cookie expired" : state.crowdmarkUser ? `Connected (${escapeHtml(state.crowdmarkUser)})` : "Configured") : "Not configured"}</strong>
+      </div>
     </div>
+
+    ${state.lastPingError ? `<div class="banner error"><strong>Keep-alive notice:</strong> ${escapeHtml(state.lastPingError)}</div>` : ""}
 
     <!-- 1. Learn Section -->
     <div class="card">
@@ -249,10 +260,12 @@ export function setupPage(state: PageState): string {
       `
           : state.knownUsername
             ? `
-        <p class="desc">Ready to sign in as <strong>${escapeHtml(state.knownUsername)}</strong> using saved credentials.</p>
+        <p class="desc">Ready to sign in as <strong>${escapeHtml(state.knownUsername)}</strong> using saved credentials. Duo verification prefers SMS/passcode (no automatic push).</p>
         <form method="POST">
           <input type="hidden" name="token" value="${token}">
           <input type="hidden" name="action" value="waterloo">
+          <label for="passcode-saved">Duo Passcode / SMS Code (optional — or enter on next screen)</label>
+          <input id="passcode-saved" name="passcode" type="text" inputmode="numeric" autocomplete="one-time-code" placeholder="Optional 6-7 digit passcode">
           <button type="submit">Sign in with Duo</button>
         </form>
         ${
@@ -267,7 +280,7 @@ export function setupPage(state: PageState): string {
         }
       `
             : `
-        <p class="desc">Enter your WatIAM login. The next screen displays the 3-digit Duo code to enter in Duo Mobile.</p>
+        <p class="desc">Enter your WatIAM login. Duo verification prefers SMS/text passcodes (never automatically triggers Duo Push).</p>
         <form method="POST">
           <input type="hidden" name="token" value="${token}">
           <input type="hidden" name="action" value="waterloo">
@@ -275,8 +288,10 @@ export function setupPage(state: PageState): string {
           <input id="username" name="username" type="text" placeholder="jw25smit@uwaterloo.ca" autocomplete="username" required>
           <label for="password">Password</label>
           <input id="password" name="password" type="password" autocomplete="current-password" required>
+          <label for="passcode">Duo Passcode / SMS Code (optional — or enter on next screen)</label>
+          <input id="passcode" name="passcode" type="text" inputmode="numeric" autocomplete="one-time-code" placeholder="Optional 6-7 digit passcode">
           <label class="check">
-            <input type="checkbox" name="remember" value="1" checked> Remember credentials securely on this server
+            <input type="checkbox" name="remember" value="1"> Remember credentials encrypted on this server
           </label>
           <button type="submit">Sign in with Duo</button>
         </form>
@@ -322,6 +337,44 @@ export function setupPage(state: PageState): string {
       }
     </div>
 
+    <!-- 2b. Crowdmark Section -->
+    <div class="card">
+      <h2>Crowdmark (Read-Only)</h2>
+      ${
+        state.crowdmarkConfigured
+          ? `
+        <p class="desc">${state.crowdmarkAlive === false ? "Cookie saved, but Crowdmark rejected it — paste a fresh Cookie header below." : `Connected${state.crowdmarkUser ? ` as <strong>${escapeHtml(state.crowdmarkUser)}</strong>` : ""}. Read-only Crowdmark tools are active.`}</p>
+        <form method="POST" style="margin-bottom:.75rem">
+          <input type="hidden" name="token" value="${token}">
+          <input type="hidden" name="action" value="crowdmark_disconnect">
+          <button type="submit" class="secondary">Disconnect Crowdmark</button>
+        </form>
+      `
+          : `<p class="desc">Optional: paste your <code>app.crowdmark.com</code> Cookie header from DevTools to enable read-only Crowdmark courses, assessments, grades, and groups tools.</p>`
+      }
+      <form method="POST">
+        <input type="hidden" name="token" value="${token}">
+        <input type="hidden" name="action" value="crowdmark_cookie">
+        <textarea name="cookie" rows="2" placeholder="_crowdmark_session=...; ..." required></textarea>
+        <button type="submit" class="secondary" style="margin-top:.5rem">Save Crowdmark Cookie</button>
+      </form>
+    </div>
+
+    ${
+      state.calendarUrl
+        ? `
+    <!-- 2c. Calendar Export -->
+    <div class="card">
+      <h2>Due-Date Calendar Feed (ICS)</h2>
+      <p class="desc">Subscribe in Google Calendar (<strong>Other calendars → From URL</strong>) to sync LEARN deadlines without any Google API key.</p>
+      <div class="input-with-copy">
+        <input type="text" readonly value="${escapeHtml(state.calendarUrl)}" id="ics-url">
+        <button type="button" class="copy-btn" onclick="copyText('ics-url', this)">Copy</button>
+      </div>
+    </div>`
+        : ""
+    }
+
     <!-- 3. Connect Assistant -->
     <div class="card">
       <h2>Connect to Claude / ChatGPT</h2>
@@ -354,7 +407,7 @@ export function setupPage(state: PageState): string {
         <details>
           <summary><b>Claude Code CLI</b> (Terminal)</summary>
           <div class="code-box">
-            <pre id="claude-cli">claude mcp add uwaterloo ${serverUrl} --header "Authorization: Bearer ${authToken}"</pre>
+            <pre id="claude-cli">claude mcp add uwaterloo ${escapeHtml(serverUrl)} --header "Authorization: Bearer ${escapeHtml(authToken)}"</pre>
             <button type="button" class="copy-btn" onclick="copyText('claude-cli', this)">Copy Command</button>
           </div>
         </details>

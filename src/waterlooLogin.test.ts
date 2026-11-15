@@ -35,15 +35,34 @@ test("declines every current and legacy trust-browser wording", () => {
   );
 });
 
-test("selects Duo Push when the account's remembered factor is different", () => {
+test("prefers SMS/passcode and never selects Duo Push automatically", () => {
+  assert.deepEqual(
+    decideDuoAction({
+      url: duoUrl,
+      text: "Choose how to verify your identity",
+      controls: ["Duo Push", "Text message passcode", "Duo Mobile passcode", "Security key"],
+    }),
+    { action: "select_sms_passcode", label: "Text message passcode" },
+  );
+
+  assert.deepEqual(
+    decideDuoAction({
+      url: duoUrl,
+      text: "Choose how to verify your identity",
+      controls: ["Duo Push", "Duo Mobile passcode", "Security key"],
+    }),
+    { action: "select_passcode", label: "Duo Mobile passcode" },
+  );
+
+  // Even if Duo Push is the only factor visible without Other options, never auto-push.
   for (const label of ["Duo Push", "Duo Push to iPhone", "Verify with Duo Push", "Send me a push"]) {
-    assert.deepEqual(
+    assert.equal(
       decideDuoAction({
         url: duoUrl,
         text: "Choose how to verify your identity",
-        controls: [label, "Duo Mobile passcode", "Security key"],
+        controls: [label, "Security key"],
       }),
-      { action: "duo_push", label },
+      null,
     );
   }
 });
@@ -59,14 +78,22 @@ test("opens Other options from a passkey or passcode screen", () => {
   );
 });
 
-test("does not cancel or duplicate a Duo Push that is already pending", () => {
+test("switches away from auto-push in interactive mode and stays inert in silent mode", () => {
   const state = {
     url: duoUrl,
     text: "Check for a Duo Push. Approve the request on your phone.",
     controls: ["Other options"],
   };
   assert.equal(duoPushIsPending(state), true);
-  assert.equal(decideDuoAction(state), null);
+  assert.equal(decideDuoAction(state, "silent"), null);
+  assert.deepEqual(decideDuoAction(state, "interactive"), {
+    action: "other_options",
+    label: "Other options",
+  });
+  assert.equal(
+    decideDuoAction({ url: duoUrl, text: state.text, controls: [] }, "interactive"),
+    null,
+  );
 });
 
 test("continues after Duo approval when Universal Prompt does not redirect", () => {

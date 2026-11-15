@@ -361,6 +361,9 @@ export const serverInfoOutput = z.object({
   piazza: z.object({
     configured: z.boolean(),
   }),
+  crowdmark: z.object({
+    configured: z.boolean(),
+  }),
 });
 
 export const getFileOutput = z.object({
@@ -656,4 +659,59 @@ export const getUpcomingOutput = z.object({
   deadlines: z.array(deadlineSchema),
   withinDays: z.number(),
   coursesChecked: z.number(),
+});
+
+export const dropboxReceiptSchema = z.object({
+  courseId: z.number(),
+  courseName: z.string(),
+  folderId: z.number(),
+  folderName: z.string(),
+  submissionId: z.number(),
+  attemptNumber: z.number(),
+  submittedAt: timestamp,
+  submitter: z.string(),
+  dueDate: timestamp,
+  isLate: z.boolean().nullable(),
+  lateByMinutes: z.number().nullable(),
+  files: z.array(
+    z.object({
+      id: z.number(),
+      name: z.string(),
+      size: z.number(),
+    }),
+  ),
+});
+
+export const getDropboxReceiptsOutput = z.object({
+  receipts: z.array(dropboxReceiptSchema),
+  failures: z.array(z.string()),
+});
+
+export const dueDateChangeSchema = z.object({
+  key: z.string(),
+  courseId: z.number(),
+  courseName: z.string(),
+  kind: z.enum(["assignment", "quiz"]),
+  id: z.number(),
+  name: z.string(),
+  changeType: z.enum(["added", "changed", "removed"]),
+  previousDueDate: timestamp,
+  newDueDate: timestamp,
+});
+
+export const getDueDateChangesOutput = z.object({
+  initialized: z.boolean(),
+  previousSnapshotAt: timestamp,
+  capturedAt: z.string(),
+  trackedCount: z.number(),
+  changes: z.array(dueDateChangeSchema),
+  failures: z.array(z.string()),
+});
+
+export const exportDueDatesIcsOutput = z.object({
+  ics: z.string(),
+  eventCount: z.number(),
+  coursesChecked: z.number(),
+  subscriptionUrl: z.string().nullable(),
+  failures: z.array(z.string()),
 });

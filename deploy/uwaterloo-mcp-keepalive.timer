@@ -1,0 +1,11 @@
+[Unit]
+Description=Run UWaterloo MCP Learn keep-alive every 45 minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=45min
+AccuracySec=1min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
