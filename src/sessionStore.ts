@@ -75,6 +75,52 @@ export interface SessionRecord {
   crowdmarkCookie?: string | undefined;
   /** Last snapshot of LEARN assignment/quiz due dates for change detection. */
   dueDateSnapshot?: DueDateSnapshot | undefined;
+  /** Daily Duo SMS request counter (America/Toronto YYYY-MM-DD) to prevent SMS loops. */
+  duoSmsAttempts?: { day: string; count: number } | undefined;
+  /** America/Toronto YYYY-MM-DD on which keep-alive was auto-paused by the SMS daily cap. */
+  duoSmsCappedDay?: string | undefined;
+}
+
+const torontoDateFormat = new Intl.DateTimeFormat("en-CA", {
+  timeZone: "America/Toronto",
+  year: "numeric",
+  month: "2-digit",
+  day: "2-digit",
+});
+
+/** Calendar date (`YYYY-MM-DD`) in `America/Toronto` for `nowMs`. */
+export function torontoDayKey(nowMs = Date.now()): string {
+  return torontoDateFormat.format(new Date(nowMs));
+}
+
+/** Number of Duo SMS requests already made today (`America/Toronto`). */
+export function getDailySmsAttemptCount(
+  record: Pick<SessionRecord, "duoSmsAttempts"> | null | undefined,
+  nowMs = Date.now(),
+): number {
+  const attempts = record?.duoSmsAttempts;
+  if (!attempts) return 0;
+  return attempts.day === torontoDayKey(nowMs) ? Math.max(0, attempts.count) : 0;
+}
+
+/** True when another Duo SMS request is permitted under the daily cap. */
+export function canRequestDuoSms(
+  record: Pick<SessionRecord, "duoSmsAttempts"> | null | undefined,
+  maxPerDay = 3,
+  nowMs = Date.now(),
+): boolean {
+  if (maxPerDay <= 0) return false;
+  return getDailySmsAttemptCount(record, nowMs) < maxPerDay;
+}
+
+/** Computes the next `{ day, count }` record after requesting one Duo SMS. */
+export function nextDailySmsAttempts(
+  existing: SessionRecord["duoSmsAttempts"] | undefined,
+  nowMs = Date.now(),
+): { day: string; count: number } {
+  const day = torontoDayKey(nowMs);
+  const currentCount = existing?.day === day ? Math.max(0, existing.count) : 0;
+  return { day, count: currentCount + 1 };
 }
 
 export type StoreKind = "blob" | "file" | "memory";

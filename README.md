@@ -45,7 +45,25 @@ This hardened fork is designed for private single-tenant self-hosting:
     ```env
     UWATERLOO_DUO_PASSCODE_HOOK=["/usr/local/bin/read-duo-sms.sh","--recent"]
     ```
-- Background / silent keep-alive runs in `mode: "silent"` and **never triggers a Duo Push or prompts for a passcode**. After failures (`invalid_credentials`, `duo_required`, or 3 consecutive failures with exponential backoff), keep-alive automatically disables itself until you sign in again at `/setup`.
+- **Automatic Speko SMS provider (`DUO_CODE_PROVIDER=speko`)**:
+  - When `DUO_CODE_PROVIDER=speko` (or `UWATERLOO_DUO_CODE_PROVIDER=speko`) and `SPEKO_API_KEY` are set, both `/setup` and unattended keep-alive can complete Duo MFA automatically without human code entry:
+    1. On the Duo prompt, the browser chooses **Other options** → **Text me / Text message passcode** matching `DUO_PHONE_LAST4` (default `9915`; never clicks Duo Push).
+    2. It polls Speko's REST API (`GET /v1/sms/messages?direction=inbound&created_after=...`) using `Authorization: Bearer <SPEKO_API_KEY>` until a new 6–7 digit Duo passcode arrives (up to `SPEKO_SMS_TIMEOUT_MS`).
+    3. It submits the passcode, selects **"Yes, this is my device"** to trust the browser, and waits for a valid LEARN session cookie.
+  - **Getting a Speko API key**: create one in the Speko dashboard under **API keys** at [platform.speko.ai](https://platform.speko.ai). Keys are shown once (typically `sk_live_...` or `sk_speko_...`); never commit them to git. `SPEKO_API_KEY`, raw SMS bodies, and Duo passcodes are **never logged** (not even truncated).
+  - **Environment variables**:
+    - `DUO_CODE_PROVIDER=speko` (also accepts `UWATERLOO_DUO_CODE_PROVIDER`)
+    - `SPEKO_API_KEY` — required Bearer token for `api.speko.dev`
+    - `SPEKO_API_BASE_URL` — optional API host override (default `https://api.speko.dev`)
+    - `SPEKO_PHONE_NUMBER` / `SPEKO_PHONE_NUMBER_ID` — optional E.164 (`+1...`) or UUID filter for your Speko inbox number
+    - `SPEKO_DUO_SENDER` / `DUO_SMS_SENDER` — optional sender filter (substring or last 4 digits, case-insensitive)
+    - `DUO_PHONE_LAST4` — last 4 digits of the target phone on Duo's SMS picker (default `9915`)
+    - `SPEKO_SMS_TIMEOUT_MS` — SMS polling timeout in ms (default `120000`)
+    - `DUO_SMS_MAX_ATTEMPTS_PER_DAY` — max Duo SMS requests per `America/Toronto` calendar day (default `3`)
+  - **Loop & SMS-spam protection**:
+    - SMS requests are capped at `DUO_SMS_MAX_ATTEMPTS_PER_DAY` (default `3`) per `America/Toronto` calendar day in the encrypted session store. If the cap is reached, no SMS is requested (`duo_sms_capped`) and keep-alive disables itself until a successful `/setup` login or the next `America/Toronto` day.
+    - Consumed Speko message IDs are tracked so the same SMS passcode is never reused.
+- Without `DUO_CODE_PROVIDER=speko`, background keep-alive runs strictly in `mode: "silent"` (trusted-browser only) and **never triggers a Duo Push or requests an SMS**. In all modes, keep-alive applies exponential backoff and disables itself on `invalid_credentials`, `duo_required`, `duo_denied`, `duo_sms_capped`, or 3 consecutive failures rather than looping.
 
 ---
 

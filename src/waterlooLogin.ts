@@ -12,7 +12,7 @@ import path from "node:path";
 import chromium from "@sparticuz/chromium";
 import puppeteer, { type Browser, type Frame, type Page } from "puppeteer-core";
 import type { WaterlooCredentials } from "./config.js";
-import type { DuoPasscodeProvider } from "./duoPasscode.js";
+import { type DuoPasscodeProvider, getDuoPhoneLast4 } from "./duoPasscode.js";
 import { validateCookie } from "./setup.js";
 import type { StoredBrowserCookie } from "./sessionStore.js";
 
@@ -30,13 +30,14 @@ const HEARTBEAT_INTERVAL_MS = 20_000;
 export type WaterlooLoginFailure =
   | "invalid_credentials"
   | "duo_required"
+  | "duo_sms_capped"
   | "duo_denied"
   | "duo_timeout"
   | "login_timeout"
   | "browser_unavailable"
   | "session_rejected";
 
-export type WaterlooLoginMode = "silent" | "interactive";
+export type WaterlooLoginMode = "silent" | "interactive" | "automatic";
 
 export class WaterlooLoginError extends Error {
   constructor(
@@ -63,6 +64,11 @@ export interface WaterlooLoginOptions {
   timeoutMs?: number | undefined;
   mode?: WaterlooLoginMode | undefined;
   passcodeProvider?: DuoPasscodeProvider | undefined;
+  phoneLast4?: string | undefined;
+  /** Called immediately before clicking a Duo SMS button; returning false aborts with `duo_sms_capped`. */
+  onBeforeSmsRequest?: (() => Promise<boolean> | boolean) | undefined;
+  /** Called when a Duo SMS button is actually clicked, with the request epoch timestamp. */
+  onSmsRequested?: ((requestedAt: number) => Promise<void> | void) | undefined;
   onEvent?: WaterlooLoginEventHandler | undefined;
   /** Cookies from a previous successful sign-in, restored before anything is opened. */
   browserCookies?: StoredBrowserCookie[] | undefined;
@@ -129,6 +135,9 @@ async function performSignIn(
     timeoutMs = DEFAULT_TIMEOUT_MS,
     mode = "interactive",
     passcodeProvider,
+    phoneLast4,
+    onBeforeSmsRequest,
+    onSmsRequested,
     onEvent,
     browserCookies,
   }: WaterlooLoginOptions,
@@ -203,7 +212,12 @@ async function performSignIn(
       (nextStage) => {
         stage = nextStage;
       },
-      onEvent,
+      {
+        phoneLast4,
+        onBeforeSmsRequest,
+        onSmsRequested,
+        onEvent,
+      },
     );
     return { ...session, browserCookies: await keptCookies(browser) };
   } catch (error) {
@@ -358,8 +372,13 @@ async function waitForSession(
   username: string,
   passcodeProvider: DuoPasscodeProvider | undefined,
   setStage: (stage: string) => void,
-  onEvent?: WaterlooLoginEventHandler,
+  hooks: Pick<
+    WaterlooLoginOptions,
+    "phoneLast4" | "onBeforeSmsRequest" | "onSmsRequested" | "onEvent"
+  > = {},
 ): Promise<Omit<WaterlooLoginResult, "browserCookies">> {
+  const { phoneLast4, onBeforeSmsRequest, onSmsRequested, onEvent } = hooks;
+  const resolvedPhoneLast4 = phoneLast4 ?? getDuoPhoneLast4();
   const deadline = Date.now() + timeoutMs;
   const completedActions = new Set<string>();
   let duoPrompted = false;
@@ -370,6 +389,7 @@ async function waitForSession(
   let lastLocation = "";
   let passcodeAttempts = 0;
   let lastPasscodeAt = 0;
+  let smsRequestedAt: number | undefined;
 
   while (Date.now() < deadline) {
     const location = safePageLocation(page);
@@ -473,7 +493,7 @@ async function waitForSession(
       .map((state, index) => ({
         state,
         frame: frames[index],
-        decision: decideDuoAction(state, mode),
+        decision: decideDuoAction(state, mode, { phoneLast4: resolvedPhoneLast4 }),
       }))
       .filter(
         (entry): entry is { state: FrameState; frame: Frame; decision: DuoActionDecision } =>
@@ -507,6 +527,7 @@ async function waitForSession(
             username,
             attempt: passcodeAttempts,
             hint: extractDuoHint(state),
+            requestedAt: smsRequestedAt,
             signal: abort.signal,
           });
         } finally {
@@ -528,10 +549,20 @@ async function waitForSession(
         break;
       }
 
-      if (emittedVerificationCode && decision.action === "other_options") continue;
+      if (mode === "interactive" && emittedVerificationCode && decision.action === "other_options") continue;
 
       const actionKey = `${decision.action}:${normalizeLabel(decision.label)}`;
       if (completedActions.has(actionKey)) continue;
+
+      if (decision.action === "select_sms_passcode" && onBeforeSmsRequest) {
+        const allowed = await onBeforeSmsRequest();
+        if (!allowed) {
+          throw new WaterlooLoginError(
+            "duo_sms_capped",
+            "Daily Duo SMS request limit reached. Keep-alive is paused until tomorrow (America/Toronto) or manual sign-in at /setup.",
+          );
+        }
+      }
 
       if (process.env.UWATERLOO_LOGIN_DEBUG === "1") {
         console.info("[waterloo-login] Duo decision", decision);
@@ -546,13 +577,19 @@ async function waitForSession(
         await page.keyboard.press("Escape").catch(() => undefined);
       }
 
+      const candidateSmsRequestedAt =
+        decision.action === "select_sms_passcode" ? Date.now() : undefined;
       const clicked = await clickControl(frame, decision.label);
       if (!clicked) continue;
 
       completedActions.add(actionKey);
       setStage(decision.action);
       console.info("[waterloo-login] handled Duo page", { action: decision.action });
-      if (decision.action === "select_sms_passcode" || decision.action === "select_passcode") {
+      if (decision.action === "select_sms_passcode" && candidateSmsRequestedAt !== undefined) {
+        smsRequestedAt = candidateSmsRequestedAt;
+        duoPrompted = true;
+        await onSmsRequested?.(candidateSmsRequestedAt);
+      } else if (decision.action === "select_passcode") {
         duoPrompted = true;
       }
       break;
@@ -656,17 +693,53 @@ function extractDuoHint(state: FrameState): string | undefined {
   return match?.[0];
 }
 
+function isSmsOptionLabel(normalized: string): boolean {
+  if (/\bpush\b/.test(normalized)) return false;
+  if (/\b(?:help|learn more|support|privacy|terms)\b/.test(normalized)) return false;
+  if (/\b(?:text message|sms)\b/.test(normalized)) {
+    return (
+      /\b(?:passcode|code|send|text|me|to|\d{4})\b/.test(normalized) ||
+      /^(?:text message|sms)$/.test(normalized)
+    );
+  }
+  return /^(?:text me|send (?:a )?text|send sms|sms passcode|text message passcode|text passcode)\b/.test(
+    normalized,
+  );
+}
+
+function selectSmsControl(
+  controls: ReadonlyArray<{ label: string; normalized: string }>,
+  phoneLast4: string,
+): { label: string; normalized: string } | undefined {
+  const smsMatches = controls.filter(({ normalized }) => isSmsOptionLabel(normalized));
+  if (smsMatches.length === 0) return undefined;
+  if (smsMatches.length === 1) return smsMatches[0];
+
+  const digits = phoneLast4.replace(/\D/g, "").slice(-4);
+  if (digits.length === 4) {
+    const last4Re = new RegExp(`\\b${digits}\\b`);
+    const preferred = smsMatches.find(({ normalized }) => last4Re.test(normalized));
+    if (preferred) return preferred;
+  }
+
+  const anyHaveDigits = smsMatches.some(({ normalized }) => /\b\d{4}\b/.test(normalized));
+  return anyHaveDigits ? undefined : smsMatches[0];
+}
+
 /**
  * Chooses one safe transition from a Duo page snapshot.
  *
  * Never auto-clicks Duo Push. In `silent` mode, only trust-device and post-approval continue
  * actions are allowed; any MFA challenge returns null so the caller aborts without pushing.
+ * In `automatic` mode, navigates via "Other options" to SMS text-message passcode (never Duo
+ * Mobile passcode or Duo Push) and submits the provider code.
  * In `interactive` mode, prefers SMS text-message passcode, then Duo Mobile / bypass passcode,
  * then "Other options" to escape remembered push/passkey defaults.
  */
 export function decideDuoAction(
   state: FrameState,
   mode: WaterlooLoginMode = "interactive",
+  options: { phoneLast4?: string | undefined } = {},
 ): DuoActionDecision | null {
   if (!isDuoPage(state)) return null;
 
@@ -702,19 +775,17 @@ export function decideDuoAction(
     return { action: "enter_passcode", label: verifyControl?.label ?? "Verify" };
   }
 
-  const smsPasscode = controls.find(
-    ({ normalized }) =>
-      (/\b(?:text message|sms)\b/.test(normalized) && /\b(?:passcode|code|send|text)\b/.test(normalized)) ||
-      /^(?:text me|send text|sms passcode|text message passcode|text passcode)$/.test(normalized),
-  );
+  const smsPasscode = selectSmsControl(controls, options.phoneLast4 ?? "9915");
   if (smsPasscode) return { action: "select_sms_passcode", label: smsPasscode.label };
 
-  const passcode = controls.find(
-    ({ normalized }) =>
-      /\b(?:duo mobile passcode|bypass code|passcode)\b/.test(normalized) &&
-      !/\bpush\b/.test(normalized),
-  );
-  if (passcode) return { action: "select_passcode", label: passcode.label };
+  if (mode === "interactive") {
+    const passcode = controls.find(
+      ({ normalized }) =>
+        /\b(?:duo mobile passcode|bypass code|passcode)\b/.test(normalized) &&
+        !/\bpush\b/.test(normalized),
+    );
+    if (passcode) return { action: "select_passcode", label: passcode.label };
+  }
 
   const otherOptions = controls.find(({ normalized }) =>
     /^(?:other options|try another method|try another way|choose another option|use a different method)$/.test(

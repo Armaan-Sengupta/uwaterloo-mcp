@@ -9,6 +9,27 @@ import { execFile } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { promisify } from "node:util";
+import {
+  SpekoDuoPasscodeProvider,
+  getDuoCodeProviderName,
+  getDuoPhoneLast4,
+  getDuoSmsMaxAttemptsPerDay,
+  isDuoSmsText,
+  isSpekoPasscodeProviderConfigured,
+  matchesDuoSender,
+  parseDuoSmsPasscode,
+} from "./spekoDuo.js";
+
+export {
+  SpekoDuoPasscodeProvider,
+  getDuoCodeProviderName,
+  getDuoPhoneLast4,
+  getDuoSmsMaxAttemptsPerDay,
+  isDuoSmsText,
+  isSpekoPasscodeProviderConfigured,
+  matchesDuoSender,
+  parseDuoSmsPasscode,
+};
 
 const execFileAsync = promisify(execFile);
 
@@ -16,6 +37,8 @@ export interface DuoPasscodeContext {
   username: string;
   attempt: number;
   hint?: string | undefined;
+  /** Epoch ms when the Duo SMS was requested, used to ignore older messages. */
+  requestedAt?: number | undefined;
   signal?: AbortSignal | undefined;
 }
 
@@ -230,9 +253,14 @@ export class ManualPasscodeCoordinator {
   }
 }
 
-/** Builds the configured env/file/hook passcode providers (empty if none configured). */
+export interface ConfiguredPasscodeProviderOptions {
+  consumedIds?: Set<string> | undefined;
+}
+
+/** Builds the configured env/file/hook/speko passcode providers (empty if none configured). */
 export function createConfiguredPasscodeProviders(
   env: Record<string, string | undefined> = process.env,
+  options: ConfiguredPasscodeProviderOptions = {},
 ): DuoPasscodeProvider[] {
   const providers: DuoPasscodeProvider[] = [];
   if (env.UWATERLOO_DUO_PASSCODE?.trim()) {
@@ -246,5 +274,24 @@ export function createConfiguredPasscodeProviders(
   if (hook) {
     providers.push(hook);
   }
+  if (getDuoCodeProviderName(env) === "speko") {
+    providers.push(
+      SpekoDuoPasscodeProvider.fromEnv(env, { consumedIds: options.consumedIds }),
+    );
+  }
   return providers;
+}
+
+/**
+ * Returns a single Duo passcode provider from environment configuration, or null if none
+ * are configured.
+ */
+export function createPasscodeProviderFromEnv(
+  env: Record<string, string | undefined> = process.env,
+  options: ConfiguredPasscodeProviderOptions = {},
+): DuoPasscodeProvider | null {
+  const providers = createConfiguredPasscodeProviders(env, options);
+  if (providers.length === 0) return null;
+  if (providers.length === 1) return providers[0]!;
+  return new CompositeDuoPasscodeProvider(providers);
 }
